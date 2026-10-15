@@ -176,7 +176,9 @@ struct ViewGuard {
     void* Release() { void* p = ptr; ptr = nullptr; return p; }
     void Close() {
         if (ptr) {
-            UnmapViewOfFile2(GetCurrentProcess(), ptr, MEM_PRESERVE_PLACEHOLDER);
+            // Views are now created with plain MapViewOfFile (no placeholder arena),
+            // so they must be released with plain UnmapViewOfFile.
+            UnmapViewOfFile(ptr);
             ptr = nullptr;
         }
     }
