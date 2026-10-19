@@ -49,9 +49,18 @@ std::string MSDFCache::GetCacheBasePath(const char* familyName, const char* styl
     std::string fam = SanitizeName(familyName);
     std::string sty = SanitizeName(styleName);
     std::string folderName = fam + "_" + sty + "_s" + std::to_string(sdfRenderSize) + "_sp" + std::to_string(sdfSpread);
-    wchar_t tempPath[MAX_PATH] = {};
-    GetTempPathW(MAX_PATH, tempPath);
-    std::filesystem::path base = std::filesystem::path(tempPath) / CACHE_DIR / folderName;
+
+    // 使用 Wow.exe 所在目录，而不是系统 Temp
+    char exePath[MAX_PATH] = {};
+    if (!GetModuleFileNameA(nullptr, exePath, MAX_PATH)) {
+        // 回退到 Temp，避免极端情况下写失败
+        wchar_t tempPath[MAX_PATH] = {};
+        GetTempPathW(MAX_PATH, tempPath);
+        return (std::filesystem::path(tempPath) / CACHE_DIR / folderName).string();
+    }
+
+    std::filesystem::path gameRoot = std::filesystem::path(exePath).parent_path();
+    std::filesystem::path base = gameRoot / CACHE_DIR / folderName;
     return base.string();
 }
 
