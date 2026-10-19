@@ -78,7 +78,8 @@ namespace {
         const double fontSizeMult = pThis->m_fontSizeMult;
         const double fontOffs = !is3d ? ((flags & 8) ? 4.5 : ((flags & 1) ? 2.5 : 0.0)) : 0.0;
         const double baselineOffs = (fontOffs > 0.0) ? 1.0 : 0.0;
-        const double scale = (is3d ? fontSizeMult : CGxuFont::GetFontEffectiveHeight(is3d, fontSizeMult) * 0.98) / MSDF::SDF_RENDER_SIZE;
+        // 去掉 0.98 缩放，减少中文被压缩导致的裁切
+        const double scale = (is3d ? fontSizeMult : CGxuFont::GetFontEffectiveHeight(is3d, fontSizeMult) * 1.0) / MSDF::SDF_RENDER_SIZE;
         const double pad = MSDF::SDF_SPREAD * scale;
 
         for (uint32_t q = 0; q < verts.m_count; q += 4) {
@@ -100,8 +101,22 @@ namespace {
                 const double leftOffs = fontObj->GetBearingX(entry, is3d, fontSizeMult);
                 const double bitmapLeft = is3d ? leftOffs : gm->bitmapLeft * scale - leftOffs;
 
-                const double newLeft = static_cast<double>(vert0->pos.X) + (bitmapLeft != leftOffs ? bitmapLeft + 1.0 : 0.0) - pad + fontOffs * 0.5;
-                const double newRight = newLeft + (gm->width * scale);
+                // 尽量沿用引擎已排好的左右边界，减少右边被切和中间重叠
+                const double origLeft  = static_cast<double>(vert0->pos.X);
+                const double origRight = static_cast<double>(vert2->pos.X);
+                const double msdfWidth = gm->width * scale;
+
+                double newLeft  = origLeft + (bitmapLeft != leftOffs ? bitmapLeft + 1.0 : 0.0) - pad + fontOffs * 0.5;
+                double newRight = newLeft + msdfWidth;
+
+                // 若 MSDF 比原布局更宽，向右扩展，避免右边被切
+                if (newRight > origRight) {
+                    newRight = origRight + pad;
+                }
+                // 防止左边过度左移导致与前一字重叠
+                if (newLeft > origLeft) {
+                    newLeft = origLeft;
+                }
 
                 const double newTop = static_cast<double>(vert1->pos.Y) + (gm->bitmapTop * scale) + pad - baselineOffs;
                 const double newBottom = newTop - (gm->height * scale);
