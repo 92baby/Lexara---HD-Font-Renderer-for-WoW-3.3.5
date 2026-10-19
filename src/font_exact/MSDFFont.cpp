@@ -61,6 +61,7 @@ void MSDFFont::ClearAllCache() {
             handle->m_glyphPool.clear();
             handle->m_atlasPages.clear();
             handle->m_oldestPage = 0;
+            handle->m_evictionPending = false;
             handle->m_evictionCount++;
         }
     }
@@ -68,6 +69,32 @@ void MSDFFont::ClearAllCache() {
 
 void MSDFFont::Shutdown() {
     s_fontHandles.clear();
+}
+
+void MSDFFont::FlushPendingEvictions() {
+    for (auto& handle : s_fontHandles | std::views::values) {
+        if (handle && handle->m_evictionPending) handle->ExecutePendingEviction();
+    }
+}
+
+void MSDFFont::ExecutePendingEviction() {
+    m_evictionPending = false;
+    // Fewer pages than the cap means page creation failed, not that the atlas is full: do not evict
+    if (m_atlasPages.size() < MSDF::MAX_ATLAS_PAGES) return;
+
+    AtlasPage* page = m_atlasPages[m_oldestPage].get();
+    for (uint32_t cp : page->codepoints) {
+        m_glyphPool.erase(cp);
+    }
+    page->Clear();
+
+    D3DLOCKED_RECT fullRect;
+    if (page->texture && SUCCEEDED(page->texture->LockRect(0, &fullRect, nullptr, 0))) {
+        memset(fullRect.pBits, 0, static_cast<size_t>(MSDF::ATLAS_SIZE) * fullRect.Pitch);
+        page->texture->UnlockRect(0);
+    }
+    m_evictionCount++;
+    m_oldestPage = (m_oldestPage + 1) % MSDF::MAX_ATLAS_PAGES;
 }
 
 const GlyphMetrics* MSDFFont::GetGlyph(uint32_t codepoint) {
@@ -78,7 +105,11 @@ const GlyphMetrics* MSDFFont::GetGlyph(uint32_t codepoint) {
     GlyphMetrics& metrics = it->second;
 
     if (m_cache->TryLoadGlyph(codepoint, metrics)) {
-        UploadGlyphToAtlas(metrics, codepoint);
+        if (!UploadGlyphToAtlas(metrics, codepoint)) {
+            // No room right now (eviction deferred) or upload failed: callers retry on later frames
+            m_glyphPool.erase(it);
+            return nullptr;
+        }
         return &metrics;
     }
 
@@ -96,6 +127,7 @@ const GlyphMetrics* MSDFFont::GetGlyph(uint32_t codepoint) {
         return nullptr;
     }
 
+    bool uploadFailed = false;
     storage.bitmapLeft = m_ftFace->glyph->bitmap_left;
     storage.bitmapTop = m_ftFace->glyph->bitmap_top;
 
@@ -111,6 +143,16 @@ const GlyphMetrics* MSDFFont::GetGlyph(uint32_t codepoint) {
         if (w > 0 && h > 0) {
             uint16_t sdfW = w + 2 * MSDF::SDF_SPREAD;
             uint16_t sdfH = h + 2 * MSDF::SDF_SPREAD;
+
+            // Check the atlas has room BEFORE generating, so no CPU is wasted on a glyph that cannot be placed.
+            // Mark eviction as pending; it runs at the start of the next batch.
+            int16_t slotPage = -1;
+            if (!AllocateSlot(sdfW, sdfH, slotPage)) {
+                m_evictionPending = true;
+                m_glyphPool.erase(it);
+                return nullptr;
+            }
+
             storage.ownedPixelData.reserve(static_cast<size_t>(sdfW) * sdfH * 4);
             if (GenerateMSDF(storage.ownedPixelData, codepoint, sdfW, sdfH)) {
                 storage.width = sdfW;
@@ -121,12 +163,17 @@ const GlyphMetrics* MSDFFont::GetGlyph(uint32_t codepoint) {
                 metrics.bitmapLeft = storage.bitmapLeft;
                 metrics.bitmapTop = storage.bitmapTop;
                 metrics.pixelData = storage.ownedPixelData.data();
-                UploadGlyphToAtlas(metrics, codepoint);
+                uploadFailed = !UploadGlyphToAtlas(metrics, codepoint);
             }
         }
     }
+    // Always store into the disk cache, whether or not the upload succeeded
     m_cache->StoreGlyph(std::move(storage));
 
+    if (uploadFailed) {
+        m_glyphPool.erase(it);
+        return nullptr;
+    }
     return &metrics;
 }
 
@@ -139,73 +186,78 @@ MSDFFont::AtlasPage* MSDFFont::GetAtlasPage(size_t index) const {
 
 bool MSDFFont::CreateAtlasPage() {
     auto page = std::make_unique<AtlasPage>(MSDF::ATLAS_GUTTER);
-    if (!D3D::CreateTexture(&page->texture, {
-        .width = MSDF::ATLAS_SIZE,
-        .height = MSDF::ATLAS_SIZE,
-        .format = MSDF::D3DFMT,
-        .pool = D3DPOOL_MANAGED
-        })) {
-        return false;
+
+    bool created = false;
+    if (s_autoMip) {
+        // Auto mipmaps: reduce shimmer / dropped strokes when minified (max LOD is clamped in the pixel shader)
+        created = D3D::CreateTexture(&page->texture, {
+            .width = MSDF::ATLAS_SIZE,
+            .height = MSDF::ATLAS_SIZE,
+            .levels = 0,
+            .usage = D3DUSAGE_AUTOGENMIPMAP,
+            .format = MSDF::D3DFMT,
+            .pool = D3DPOOL_MANAGED
+            });
+        if (!created) s_autoMip = false; // unsupported by driver: fall back to a single level
     }
+    if (!created) {
+        created = D3D::CreateTexture(&page->texture, {
+            .width = MSDF::ATLAS_SIZE,
+            .height = MSDF::ATLAS_SIZE,
+            .format = MSDF::D3DFMT,
+            .pool = D3DPOOL_MANAGED
+            });
+    }
+    if (!created) return false;
+
     m_atlasPages.push_back(std::move(page));
     return true;
+}
+
+bool MSDFFont::AllocateSlot(uint16_t w, uint16_t h, int16_t& outPage) {
+    for (size_t i = 0; i < m_atlasPages.size(); ++i) {
+        AtlasPage* page = m_atlasPages[i].get();
+        if (page->nextX + w + MSDF::ATLAS_GUTTER <= MSDF::ATLAS_SIZE &&
+            page->nextY + h + MSDF::ATLAS_GUTTER <= MSDF::ATLAS_SIZE) {
+            outPage = static_cast<int16_t>(i);
+            return true;
+        }
+        int nextY = page->nextY + page->rowHeight + MSDF::ATLAS_GUTTER;
+        if (nextY + h + MSDF::ATLAS_GUTTER <= MSDF::ATLAS_SIZE) {
+            page->nextX = MSDF::ATLAS_GUTTER;
+            page->nextY = nextY;
+            page->rowHeight = 0;
+            outPage = static_cast<int16_t>(i);
+            return true;
+        }
+    }
+    if (m_atlasPages.size() < MSDF::MAX_ATLAS_PAGES) {
+        if (!CreateAtlasPage()) return false;
+        outPage = static_cast<int16_t>(m_atlasPages.size() - 1);
+        return true;
+    }
+    return false; // full: caller marks eviction as pending
 }
 
 bool MSDFFont::UploadGlyphToAtlas(GlyphMetrics& metrics, uint32_t codepoint) {
     if (!metrics.pixelData || metrics.width == 0 || metrics.height == 0) return true;
 
     int16_t pageIndex = -1;
-    AtlasPage* targetPage = nullptr;
-
-    for (size_t i = 0; i < m_atlasPages.size(); ++i) {
-        AtlasPage* page = m_atlasPages[i].get();
-        if (page->nextX + metrics.width + MSDF::ATLAS_GUTTER <= MSDF::ATLAS_SIZE &&
-            page->nextY + metrics.height + MSDF::ATLAS_GUTTER <= MSDF::ATLAS_SIZE) {
-            pageIndex = static_cast<int16_t>(i);
-            targetPage = page;
-            break;
-        }
-        int nextY = page->nextY + page->rowHeight + MSDF::ATLAS_GUTTER;
-        if (nextY + metrics.height + MSDF::ATLAS_GUTTER <= MSDF::ATLAS_SIZE) {
-            page->nextX = MSDF::ATLAS_GUTTER;
-            page->nextY = nextY;
-            page->rowHeight = 0;
-            pageIndex = static_cast<int16_t>(i);
-            targetPage = page;
-            break;
-        }
+    if (!AllocateSlot(metrics.width, metrics.height, pageIndex)) {
+        // Never evict mid-frame: strings already processed this frame would point at wiped atlas regions.
+        m_evictionPending = true;
+        return false;
     }
-    if (pageIndex == -1) {
-        if (m_atlasPages.size() >= MSDF::MAX_ATLAS_PAGES) {
-            pageIndex = m_oldestPage;
-            targetPage = m_atlasPages[m_oldestPage].get();
-
-            for (uint32_t cp : targetPage->codepoints) {
-                auto it = m_glyphPool.find(cp);
-                if (it != m_glyphPool.end()) {
-                    m_glyphPool.erase(it);
-                }
-            }
-            targetPage->Clear();
-
-            D3DLOCKED_RECT fullRect;
-            if (SUCCEEDED(targetPage->texture->LockRect(0, &fullRect, nullptr, 0))) {
-                memset(fullRect.pBits, 0, MSDF::ATLAS_SIZE * fullRect.Pitch);
-                targetPage->texture->UnlockRect(0);
-            }
-            m_evictionCount++;
-            m_oldestPage = (m_oldestPage + 1) % MSDF::MAX_ATLAS_PAGES;
-        }
-        else {
-            if (!CreateAtlasPage()) return false;
-            pageIndex = static_cast<int16_t>(m_atlasPages.size() - 1);
-            targetPage = m_atlasPages.back().get();
-        }
-    }
+    AtlasPage* targetPage = m_atlasPages[pageIndex].get();
     if (!targetPage->texture) return false;
 
+    // Lock only this glyph's sub-rectangle: avoids dirtying and re-uploading the whole 16MB page
+    RECT lockRect = {
+        targetPage->nextX, targetPage->nextY,
+        targetPage->nextX + metrics.width, targetPage->nextY + metrics.height
+    };
     D3DLOCKED_RECT lockedRect;
-    if (FAILED(targetPage->texture->LockRect(0, &lockedRect, nullptr, 0))) {
+    if (FAILED(targetPage->texture->LockRect(0, &lockedRect, &lockRect, 0))) {
         return false;
     }
     if (lockedRect.Pitch < metrics.width * 4) {
@@ -214,8 +266,7 @@ bool MSDFFont::UploadGlyphToAtlas(GlyphMetrics& metrics, uint32_t codepoint) {
     }
 
     const unsigned char* src = metrics.pixelData;
-    unsigned char* dest = static_cast<unsigned char*>(lockedRect.pBits) +
-        targetPage->nextY * lockedRect.Pitch + targetPage->nextX * 4;
+    unsigned char* dest = static_cast<unsigned char*>(lockedRect.pBits); // already points at the sub-rect's top-left
     for (uint16_t y = 0; y < metrics.height; ++y) {
         memcpy(dest, src, metrics.width * 4);
         dest += lockedRect.Pitch;

@@ -47,8 +47,18 @@ public:
     static void ClearAllCache();
     static void Shutdown();
 
+    // Call at the start of each font batch: runs atlas evictions deferred from the previous batch.
+    static void FlushPendingEvictions();
+
+    // True if atlas pages are created with auto-generated mipmaps.
+    static bool IsAutoMipEnabled() { return s_autoMip; }
+
 private:
     bool CreateAtlasPage();
+    // Find room for a w x h glyph (may wrap to a new row or create a page). Never evicts. False if full.
+    bool AllocateSlot(uint16_t w, uint16_t h, int16_t& outPage);
+    // Run a deferred eviction: clear the oldest page and bump the eviction counter.
+    void ExecutePendingEviction();
     bool UploadGlyphToAtlas(GlyphMetrics& metrics, uint32_t codepoint);
     bool GenerateMSDF(std::vector<uint8_t>& outData, uint32_t codepoint, int sdfW, int sdfH) const;
 
@@ -59,6 +69,7 @@ private:
     bool m_isValid;
     uint16_t m_oldestPage;
 	uint32_t m_evictionCount;
+    bool m_evictionPending = false; // atlas full: eviction is deferred to the start of the next batch
 
     std::unique_ptr<MSDFCache> m_cache;
     std::vector<std::unique_ptr<AtlasPage>> m_atlasPages;
@@ -68,4 +79,7 @@ private:
     inline static ankerl::unordered_dense::map<FT_Face, std::unique_ptr<MSDFFont>> s_fontHandles;
 
     inline static thread_local VectorPool<float> m_msdfPool;
+
+    // Whether atlas pages use auto-generated mipmaps (falls back to false if creation fails)
+    inline static bool s_autoMip = true;
 };

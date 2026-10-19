@@ -44,7 +44,7 @@ private:
     static constexpr uint32_t CACHE_VERSION = 1;
     static constexpr uint32_t BLOCK_MAGIC = 0x4D534442;
     static constexpr uint32_t MANIFEST_MAGIC = 0x4D534D46;
-    static constexpr size_t WRITE_BATCH_SIZE = 64;
+    static constexpr size_t WRITE_BATCH_SIZE = 512; // larger = fewer synchronous disk writes on the render thread (flushed on shutdown)
     static constexpr size_t BLOCK_SIZE = 512;
     static constexpr size_t MAX_SAFE_ALLOCATION = 32 * 1024 * 1024;
 

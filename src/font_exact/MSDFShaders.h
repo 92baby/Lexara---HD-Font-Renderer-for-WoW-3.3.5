@@ -73,14 +73,20 @@ inline auto* pixelShaderHLSL = R"(
 
 		int atlasPage = int(IN.pageIdx.x + 0.5f);
 
+		// atlas texels covered per screen pixel (>1 means minified)
+		float footprint = max(fwidth(uv.x), fwidth(uv.y)) * control.a;
+		// use mips when minified to avoid shimmer; LOD capped at 2 (gutter is only ~10px, higher levels bleed into neighbours)
+		float lod = clamp(log2(max(footprint, 1.0f)) - 0.5f, 0.0f, 2.0f);
+		float4 uvl = float4(uv, 0.0f, lod);
+
 		float4 sample;
-		if (atlasPage == 0) sample = tex2D(sdfAtlas0, uv);
-		else if (atlasPage == 1) sample = tex2D(sdfAtlas1, uv);
-		else if (atlasPage == 2) sample = tex2D(sdfAtlas2, uv);
-		else sample = tex2D(sdfAtlas3, uv);
+		if (atlasPage == 0) sample = tex2Dlod(sdfAtlas0, uvl);
+		else if (atlasPage == 1) sample = tex2Dlod(sdfAtlas1, uvl);
+		else if (atlasPage == 2) sample = tex2Dlod(sdfAtlas2, uvl);
+		else sample = tex2Dlod(sdfAtlas3, uvl);
 
 		float sd = median(sample.r, sample.g, sample.b);
-		float screenPxRange = (control.z / max(max(fwidth(uv.x), fwidth(uv.y)) * control.a, 1e-6)) * (1.0f - min(0.3f, fontSize * 0.0035f)); // smoother edges for larger text
+		float screenPxRange = (control.z / max(footprint, 1e-6)) * (1.0f - min(0.3f, fontSize * 0.0035f)); // smoother edges for larger text
 		float opacity = saturate((sd - 0.5f) * screenPxRange + 0.5f);
 
 		if (outlinePx > 0.0f) {

@@ -75,6 +75,11 @@ namespace {
         }
     }
 
+    // Called from the asm hook: run evictions deferred from the previous batch before validating strings
+    void __cdecl FlushFontEvictions() {
+        MSDFFont::FlushPendingEvictions();
+    }
+
     void __cdecl PrefetchCodepoints(CGxString* pThis) {
         if (s_prefetchPayload.empty()) return;
         if (!pThis || reinterpret_cast<uintptr_t>(pThis) & 1) return;
@@ -93,13 +98,13 @@ namespace {
         MSDFFont* fontHandle = MSDFFont::Get(pThis->GetFontFace());
         if (!fontHandle) return;
 
-        // 已处理、版本一致、且没有待处理标记 -> 跳过。
-        // 其余情况（待处理 / 版本不符 / 清除后无标记）都会扫描 u>1 的四边形，
-        // 不再只依赖 0x40000000，避免重建后的几何体被漏处理而不可见。
+        // 已盖过版本章且没有待处理标记 -> 跳过（无论版本是否一致）。
+        // 版本不一致的旧字符串必须留给下一帧的 CheckGeometryHk 去 ClearInstanceData 重建；
+        // 如果在这里重新盖章，会把过期的 UV 当成最新的锁死。
+        // 只有“待处理”或“既没有令牌也没有待处理位（刚被清除重建）”才扫描 u>1 的四边形。
         {
             const uint32_t hi = pThis->m_flags >> 24;
-            const uint32_t cur = fontHandle->GetAtlasEvictionCount() & kVersionMask;
-            if ((hi & 0x80) && (hi & kVersionMask) == cur && !(hi & 0x40)) return;
+            if ((hi & 0x80) && !(hi & 0x40)) return;
         }
 
         CGxFontGeomBatch* batch = pThis->m_geomBuffers[0];
@@ -222,7 +227,11 @@ namespace {
                 device->SetSamplerState(slot, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
                 device->SetSamplerState(slot, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
                 device->SetSamplerState(slot, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
-                device->SetSamplerState(slot, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
+                // Auto-generated mipmaps report GetLevelCount() == 1, so use the font's flag instead.
+                // Trilinear when mips exist (the shader picks the LOD via tex2Dlod); pages without mips just use level 0.
+                device->SetSamplerState(slot, D3DSAMP_MIPFILTER, MSDFFont::IsAutoMipEnabled() ? D3DTEXF_LINEAR : D3DTEXF_NONE);
+                device->SetSamplerState(slot, D3DSAMP_MIPMAPLODBIAS, 0);
+                device->SetSamplerState(slot, D3DSAMP_MAXMIPLEVEL, 0);
             }
         }
 
@@ -283,6 +292,7 @@ namespace {
     __declspec(naked) void CGxString__CheckGeometry_siteHk() {
         __asm {
             pushad;
+            call FlushFontEvictions;
             mov edi, ebx;
 
             test ebx, ebx;
