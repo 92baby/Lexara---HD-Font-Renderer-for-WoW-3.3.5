@@ -43,7 +43,7 @@ namespace {
         const std::string locale = MSDF::GetGameLocale();
         const bool isCjk = (locale == "zhCN" || locale == "zhTW" || locale == "koKR");
         if (isCjk) {
-            Log("[MSDF] CJK locale detected (%s)", locale.c_str());
+            Log("[MSDF] CJK locale detected (%s) — MSDF enabled (pre-generation recommended)", locale.c_str());
         } else {
             Log("[MSDF] Locale: %s", locale.c_str());
         }

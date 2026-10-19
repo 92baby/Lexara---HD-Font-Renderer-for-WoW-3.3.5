@@ -436,7 +436,11 @@ namespace {
 
             MSDF::INITIALIZED = true;
 
-            if (MSDF::IS_CJK) return FreeType::InitFn(memory, alibrary);
+            // Previously CJK locales early-returned and disabled MSDF entirely.
+            // Now we enable the full MSDF path for zhCN/zhTW/koKR as well.
+            // Chinese/Korean still benefit from pre-generation (see MSDFPregen)
+            // because the CJK range is large; without it the first appearance
+            // of many glyphs can stutter.
 
             DetourTransactionBegin();
             DetourUpdateThread(GetCurrentThread());
@@ -534,9 +538,7 @@ namespace {
             s_prefetchPayload.reserve(16383);
             CGxDevice::InitFontIndexBufferFn();
         }
-        else if (MSDF::IS_CJK) {
-            return FreeType::InitFn(memory, alibrary);
-        }
+
         if (const FT_Error error = FT_Init_FreeType(&MSDF::g_realFtLibrary)) return error;
 
         if (alibrary) *alibrary = MSDF::g_realFtLibrary;
