@@ -50,7 +50,7 @@ namespace MSDF {
 	inline FT_Library g_realFtLibrary = nullptr;
 	inline msdfgen::FreetypeHandle* g_msdfFreetype = nullptr;
 
-    inline constexpr uint32_t MAX_ATLAS_PAGES = 12;
+    inline constexpr uint32_t MAX_ATLAS_PAGES = 4;
     inline constexpr size_t CJK_CACHE_THRESHOLD = 16661;
 
 	inline bool IS_CJK = false;
