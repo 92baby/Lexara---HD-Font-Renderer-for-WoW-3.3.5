@@ -38,9 +38,9 @@ namespace MSDF {
 	inline constexpr uint32_t ATLAS_SIZE = 2048; // 1024-2048
 	inline constexpr uint32_t PREGEN_START_KEY = VK_F11;
 	inline constexpr uint32_t SDF_SAMPLER_SLOT = 23;
-	inline constexpr uint32_t ATLAS_GUTTER = 14; // usually spread + 2-4
-	inline constexpr uint32_t SDF_RENDER_SIZE = 96; // 48-128
-	inline constexpr uint32_t SDF_SPREAD = 12; // 6-12
+	inline constexpr uint32_t ATLAS_GUTTER = 10; // usually spread + 2-4
+	inline constexpr uint32_t SDF_RENDER_SIZE = 64; // 48-128 (中文客户端：降低以提高图集容量)
+	inline constexpr uint32_t SDF_SPREAD = 8; // 6-12
 	inline constexpr D3DFORMAT D3DFMT = D3DFMT_A8R8G8B8; // D3DFMT_A8R8G8B8-D3DFMT_A16B16G16R16
 	// ----
 

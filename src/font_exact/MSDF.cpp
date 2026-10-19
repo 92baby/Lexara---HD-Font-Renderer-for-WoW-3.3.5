@@ -44,7 +44,36 @@ namespace {
     constexpr uintptr_t bufalloc_3_site_jmpback = 0x006C4C4B;
 
     bool s_msdfInitHookArmed = false;
-    std::vector<uint8_t> s_prefetchPayload;
+    std::vector<uint32_t> s_prefetchPayload;
+
+    // 状态位布局（CGxString::m_flags 高字节）：
+    //   bit 31      : 版本令牌有效
+    //   bit 30      : 待处理（0x40000000，由 InitializeTextLine 置位）
+    //   bit 24-29   : 图集淘汰版本（仅 6 位，避免与 bit 30 冲突）
+    constexpr uint32_t kPendingFlag = 0x40000000;
+    constexpr uint32_t kVersionMask = 0x3F;
+
+    // 把 UTF-8 文本解码为 Unicode 码点（中文客户端文本为 UTF-8 多字节）
+    void AppendUtf8Codepoints(const char* text, std::vector<uint32_t>& out) {
+        const uint8_t* s = reinterpret_cast<const uint8_t*>(text);
+        while (*s) {
+            uint32_t cp = 0;
+            int n = 0;
+            if (*s < 0x80)               { cp = *s;        n = 1; }
+            else if ((*s & 0xE0) == 0xC0) { cp = *s & 0x1F; n = 2; }
+            else if ((*s & 0xF0) == 0xE0) { cp = *s & 0x0F; n = 3; }
+            else if ((*s & 0xF8) == 0xF0) { cp = *s & 0x07; n = 4; }
+            else { ++s; continue; }
+
+            int i = 1;
+            for (; i < n && (s[i] & 0xC0) == 0x80; ++i) {
+                cp = (cp << 6) | (s[i] & 0x3F);
+            }
+            if (i < n) { s += i; continue; } // 非法或被截断的序列
+            out.push_back(cp);
+            s += n;
+        }
+    }
 
     void __cdecl PrefetchCodepoints(CGxString* pThis) {
         if (s_prefetchPayload.empty()) return;
@@ -61,10 +90,17 @@ namespace {
     }
 
     void __fastcall ProcessGeometry(CGxString* pThis) {
-        if (!(pThis->m_flags & 0x40000000)) return;
-
         MSDFFont* fontHandle = MSDFFont::Get(pThis->GetFontFace());
         if (!fontHandle) return;
+
+        // 已处理、版本一致、且没有待处理标记 -> 跳过。
+        // 其余情况（待处理 / 版本不符 / 清除后无标记）都会扫描 u>1 的四边形，
+        // 不再只依赖 0x40000000，避免重建后的几何体被漏处理而不可见。
+        {
+            const uint32_t hi = pThis->m_flags >> 24;
+            const uint32_t cur = fontHandle->GetAtlasEvictionCount() & kVersionMask;
+            if ((hi & 0x80) && (hi & kVersionMask) == cur && !(hi & 0x40)) return;
+        }
 
         CGxFontGeomBatch* batch = pThis->m_geomBuffers[0];
         if (!batch || batch->m_verts.m_count < 4) return;
@@ -81,6 +117,7 @@ namespace {
         // 去掉 0.98 缩放，减少中文被压缩导致的裁切
         const double scale = (is3d ? fontSizeMult : CGxuFont::GetFontEffectiveHeight(is3d, fontSizeMult) * 1.0) / MSDF::SDF_RENDER_SIZE;
         const double pad = MSDF::SDF_SPREAD * scale;
+        bool incomplete = false; // 有字形暂时拿不到 -> 不盖章，下一帧重试
 
         for (uint32_t q = 0; q < verts.m_count; q += 4) {
             CGxFontVertex* vBase = &verts.m_data[q];
@@ -88,10 +125,10 @@ namespace {
                 const uint32_t codepoint = vBase[0].u - 1.0f;
 
                 const GlyphMetrics* gm = fontHandle->GetGlyph(codepoint);
-                if (!gm) continue;
+                if (!gm) { incomplete = true; continue; }
 
                 CGxGlyphCacheEntry* entry = fontObj->GetOrCreateGlyphEntry(codepoint);
-                if (!entry) continue;
+                if (!entry) { incomplete = true; continue; }
 
                 CGxFontVertex* vert0 = &vBase[0];
                 CGxFontVertex* vert1 = &vBase[1];
@@ -101,22 +138,14 @@ namespace {
                 const double leftOffs = fontObj->GetBearingX(entry, is3d, fontSizeMult);
                 const double bitmapLeft = is3d ? leftOffs : gm->bitmapLeft * scale - leftOffs;
 
-                // 尽量沿用引擎已排好的左右边界，减少右边被切和中间重叠
+                // 使用 MSDF 的真实宽度，不再钳制左右边界：
+                // 钳制会改变四边形宽度而 UV 不变，造成字形横向压缩/裁切。
+                // 四边形外圈的 padding 在 SDF 中是透明的，重叠不影响显示。
                 const double origLeft  = static_cast<double>(vert0->pos.X);
-                const double origRight = static_cast<double>(vert2->pos.X);
                 const double msdfWidth = gm->width * scale;
 
-                double newLeft  = origLeft + (bitmapLeft != leftOffs ? bitmapLeft + 1.0 : 0.0) - pad + fontOffs * 0.5;
-                double newRight = newLeft + msdfWidth;
-
-                // 若 MSDF 比原布局更宽，向右扩展，避免右边被切
-                if (newRight > origRight) {
-                    newRight = origRight + pad;
-                }
-                // 防止左边过度左移导致与前一字重叠
-                if (newLeft > origLeft) {
-                    newLeft = origLeft;
-                }
+                const double newLeft  = origLeft + (bitmapLeft != leftOffs ? bitmapLeft + 1.0 : 0.0) - pad + fontOffs * 0.5;
+                const double newRight = newLeft + msdfWidth;
 
                 const double newTop = static_cast<double>(vert1->pos.Y) + (gm->bitmapTop * scale) + pad - baselineOffs;
                 const double newBottom = newTop - (gm->height * scale);
@@ -140,9 +169,12 @@ namespace {
                 vert3->u = u1 * uSign; vert3->v = v1 * vSign;
             }
         }
-        pThis->m_flags &= ~0x40000000;
 
-        uint32_t versionToken = (fontHandle->GetAtlasEvictionCount() & 0x7F) | 0x80;
+        // 有字形没拿到：保留现有标记、不盖版本章，下一帧 CheckGeometry 会再次进来重试
+        if (incomplete) return;
+
+        // 令牌只用 6 位，避免与待处理位 0x40000000 冲突；盖章同时清掉待处理位
+        const uint32_t versionToken = (fontHandle->GetAtlasEvictionCount() & kVersionMask) | 0x80;
         pThis->m_flags = (pThis->m_flags & 0x00FFFFFF) | (versionToken << 24);
     }
 
@@ -150,8 +182,8 @@ namespace {
         if (MSDFFont* fontHandle = MSDFFont::Get(pThis->GetFontFace())) {
             uint32_t highByte = (pThis->m_flags >> 24) & 0xFF;
             if ((highByte & 0x80) != 0) {
-                uint8_t storedVersion = highByte & 0x7F;
-                uint8_t currentVersion = static_cast<uint8_t>(fontHandle->GetAtlasEvictionCount() & 0x7F);
+                uint8_t storedVersion = highByte & kVersionMask;
+                uint8_t currentVersion = static_cast<uint8_t>(fontHandle->GetAtlasEvictionCount() & kVersionMask);
                 if (storedVersion != currentVersion) {
                     pThis->ClearInstanceData();
                     pThis->m_flags &= 0x00FFFFFF;
@@ -240,11 +272,11 @@ namespace {
     int __fastcall CGxString__InitializeTextLineHk(CGxString* pThis, void* edx, char* text, int textLength, int* a4, C3Vector* startPos, void* a6, int a7) {
         const int result = pThis->InitializeTextLine(text, textLength, a4, startPos, a6, a7);
 
-        if (pThis->m_flags & 0x40000000) return result;
-        for (char* p = pThis->m_text; *p; ++p) {
-            s_prefetchPayload.push_back(static_cast<uint8_t>(*p));
+        if (pThis->m_flags & kPendingFlag) return result;
+        if (pThis->m_text) {
+            AppendUtf8Codepoints(pThis->m_text, s_prefetchPayload);
         }
-        pThis->m_flags |= 0x40000000;
+        pThis->m_flags |= kPendingFlag;
         return result;
     }
 
