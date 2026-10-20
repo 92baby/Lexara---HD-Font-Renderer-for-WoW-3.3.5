@@ -114,6 +114,7 @@ namespace {
     // Called from the asm hook: run evictions deferred from the previous batch before validating strings
     void __cdecl FlushFontEvictions() {
         MSDFFont::FlushPendingEvictions();
+        MSDFFont::StepDiskWarmup();
     }
 
     void __cdecl PrefetchCodepoints(CGxString* pThis) {
@@ -187,7 +188,9 @@ namespace {
             if (vBase[0].u > 1.0f) {
                 const uint32_t codepoint = vBase[0].u - 1.0f;
 
-                const GlyphMetrics* gm = fontHandle->GetGlyph(codepoint);
+                // 3D nameplates generate missing glyphs on the render thread so mid-name characters
+                // (e.g. 世界 in 旧世界武器军需官) do not stay blank for many frames waiting on workers.
+                const GlyphMetrics* gm = fontHandle->GetGlyph(codepoint, /*preferSync=*/is3d);
                 if (!gm) { incomplete = true; if (!missingCp) { missingCp = codepoint; missingWhy = 1; } continue; }
 
                 CGxGlyphCacheEntry* entry = fontObj->GetOrCreateGlyphEntry(codepoint);

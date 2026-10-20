@@ -91,6 +91,27 @@ void MSDFFont::FlushPendingEvictions() {
     }
 }
 
+void MSDFFont::StepDiskWarmup() {
+    constexpr size_t kPerFontPerFrame = 16;
+    for (auto& handle : s_fontHandles | std::views::values) {
+        if (!handle || !handle->m_cache || handle->m_warmupDone || !handle->m_isValid) continue;
+
+        std::vector<uint32_t> batch;
+        batch.reserve(kPerFontPerFrame);
+        const size_t n = handle->m_cache->CollectCachedCodepoints(batch, kPerFontPerFrame, handle->m_warmupIndex);
+        if (n == 0) {
+            handle->m_warmupDone = true;
+            continue;
+        }
+        for (uint32_t cp : batch) {
+            if (handle->m_glyphPool.find(cp) != handle->m_glyphPool.end()) continue;
+            // Disk only — GetGlyph will TryLoadGlyph then upload (no worker for cache hits)
+            handle->GetGlyph(cp, false);
+        }
+        if (handle->m_evictionPending) break;
+    }
+}
+
 void MSDFFont::ExecutePendingEviction() {
     m_evictionPending = false;
     // Free at most a couple of tiles per batch; glyphs that did not fit are retried on later frames.
@@ -165,7 +186,7 @@ void MSDFFont::AccumulateString(const void* key, uint32_t tileMask, bool complet
     si.complete = complete;
 }
 
-const GlyphMetrics* MSDFFont::GetGlyph(uint32_t codepoint) {
+const GlyphMetrics* MSDFFont::GetGlyph(uint32_t codepoint, bool preferSync) {
     auto pit = m_glyphPool.find(codepoint);
     if (pit != m_glyphPool.end()) {
         if (pit->second.atlasTile != 0xFF) m_tiles.Touch(pit->second.atlasTile);
@@ -274,7 +295,8 @@ const GlyphMetrics* MSDFFont::GetGlyph(uint32_t codepoint) {
                     return nullptr;
                 }
 
-                if (m_asyncGen && sdfW <= 512 && sdfH <= 512) {
+                // 3D nameplates: preferSync skips the worker queue so the glyph is ready this frame.
+                if (m_asyncGen && !preferSync && sdfW <= 512 && sdfH <= 512) {
                     // Hand the expensive part to a worker thread; the render thread only uploads the result later.
                     StartGenWorkers();
                     if (!m_genThreads.empty()) {
