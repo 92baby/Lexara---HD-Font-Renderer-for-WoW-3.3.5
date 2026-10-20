@@ -11,18 +11,25 @@
 namespace {
     uint32_t g_runtimeVBSize = 0;
 
-    // DIAG hotkeys (in-game A/B test for missing glyphs):
-    //   F9  = sample atlas at mip level 0 only (no mip filtering)
-    //   F10 = disable depth writes while drawing MSDF text
+    // 3D text (names above heads): glyph quads are padded by the SDF spread, so neighbouring quads (and the
+    // shadow copy) overlap in the same plane. With depth writes on, which quad wins the depth test depends on
+    // float rounding, i.e. on the camera angle -> glyphs vanish / flicker. So depth writes are turned off
+    // for 3D MSDF text, right before each draw call (the game may re-set the state at any time).
+    //
+    // Hotkeys for A/B comparison (Ctrl+Shift held, so they do not collide with game key bindings):
+    //   Ctrl+Shift+F9  = toggle: sample atlas at mip level 0 only
+    //   Ctrl+Shift+F10 = toggle: depth-write-off for 3D text (default ON)
     bool s_diagNoMip = false;
-    bool s_diagNoZWrite = false;
+    bool s_diagNoZWrite = true;
+    bool s_text3dActive = false;
     bool s_diagZSaved = false;
     DWORD s_diagSavedZ = TRUE;
 
     void DiagPollKeys() {
         static bool d9 = false, d10 = false;
-        const bool k9 = (GetAsyncKeyState(VK_F9) & 0x8000) != 0;
-        const bool k10 = (GetAsyncKeyState(VK_F10) & 0x8000) != 0;
+        const bool mods = (GetAsyncKeyState(VK_CONTROL) & 0x8000) && (GetAsyncKeyState(VK_SHIFT) & 0x8000);
+        const bool k9 = mods && (GetAsyncKeyState(VK_F9) & 0x8000) != 0;
+        const bool k10 = mods && (GetAsyncKeyState(VK_F10) & 0x8000) != 0;
         if (k9 && !d9) { s_diagNoMip = !s_diagNoMip; Log("[DIAG] F9: noMip = %d", s_diagNoMip ? 1 : 0); }
         if (k10 && !d10) { s_diagNoZWrite = !s_diagNoZWrite; Log("[DIAG] F10: noZWrite = %d", s_diagNoZWrite ? 1 : 0); }
         d9 = k9; d10 = k10;
@@ -302,18 +309,13 @@ namespace {
         device->SetPixelShaderConstantF(MSDF::SDF_SAMPLER_SLOT, controlFlag, 1);
         device->SetVertexShaderConstantF(MSDF::SDF_SAMPLER_SLOT, controlFlag, 1);
 
-        if (s_diagNoZWrite) {
-            if (!s_diagZSaved) {
-                device->GetRenderState(D3DRS_ZWRITEENABLE, &s_diagSavedZ);
-                s_diagZSaved = true;
-            }
-            device->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
-        }
+        s_text3dActive = is3d; // the draw callback (registered in FreeType_InitHk) acts on this
     }
 
     void __fastcall CGxuFontRenderBatchHk(CGxuFont* pThis) {
         DiagPollKeys();
         pThis->RenderBatch();
+        s_text3dActive = false;
         if (s_diagZSaved) {
             if (IDirect3DDevice9* d = D3D::GetDevice()) d->SetRenderState(D3DRS_ZWRITEENABLE, s_diagSavedZ);
             s_diagZSaved = false;
@@ -601,6 +603,15 @@ namespace {
             Hooks::Detour(&CGxString::WriteGeometryFn, CGxString__WriteGeometryHk);
             Hooks::Detour(&CGxString::InitializeTextLineFn, CGxString__InitializeTextLineHk);
             DetourTransactionCommit();
+
+            D3D::RegisterDrawIndexedPrimitiveCallback([](IDirect3DDevice9* dev, D3DPRIMITIVETYPE, INT, UINT, UINT, UINT, UINT) {
+                if (!s_text3dActive || !s_diagNoZWrite) return;
+                if (!s_diagZSaved) {
+                    dev->GetRenderState(D3DRS_ZWRITEENABLE, &s_diagSavedZ);
+                    s_diagZSaved = true;
+                }
+                dev->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
+            });
 
             D3D::RegisterOnDestroy([]() {
                 if (s_cachedPS) { s_cachedPS->Release(); s_cachedPS = nullptr; }
