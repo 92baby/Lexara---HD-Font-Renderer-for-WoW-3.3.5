@@ -200,7 +200,11 @@ const GlyphMetrics* MSDFFont::GetGlyph(uint32_t codepoint, bool preferSync) {
         if (!UploadGlyphToAtlas(metrics, codepoint)) {
             // No room right now (eviction deferred) or upload failed: callers retry on later frames
             static int s_n = 0;
-            if (s_n < 200) { ++s_n; Log("[DIAG] cache-hit glyph U+%04X upload failed (w=%u h=%u, evictPending=%d)", codepoint, metrics.width, metrics.height, m_evictionPending ? 1 : 0); }
+            if (s_n < 200 || preferSync) {
+                ++s_n;
+                Log("[DIAG] cache-hit glyph U+%04X upload failed (w=%u h=%u, evictPending=%d, preferSync=%d)",
+                    codepoint, metrics.width, metrics.height, m_evictionPending ? 1 : 0, preferSync ? 1 : 0);
+            }
             m_glyphPool.erase(it);
             return nullptr;
         }
@@ -249,9 +253,14 @@ const GlyphMetrics* MSDFFont::GetGlyph(uint32_t codepoint, bool preferSync) {
                 if (s_n < 200) { ++s_n; Log("[DIAG] GenerateMSDF FAILED for U+%04X (background) -> stored as blank", codepoint); }
             }
         } else if (m_inflight.count(codepoint)) {
-            // A worker is on it: callers retry on later frames.
-            m_glyphPool.erase(it);
-            return nullptr;
+            if (!preferSync) {
+                // A worker is on it: 2D callers retry on later frames.
+                m_glyphPool.erase(it);
+                return nullptr;
+            }
+            // 3D preferSync: do not wait on the queue — generate on this thread.
+            // Worker result, if any, will land in m_done and be ignored if pool already has the glyph.
+            m_inflight.erase(codepoint);
         }
     }
 
@@ -353,6 +362,14 @@ const GlyphMetrics* MSDFFont::GetGlyph(uint32_t codepoint, bool preferSync) {
         if (fromWorker && keep.ok) {
             keep.stored = true;
             m_done[codepoint] = std::move(keep);
+        }
+        if (preferSync) {
+            static int s_ps = 0;
+            if (s_ps < 100) {
+                ++s_ps;
+                Log("[DIAG] preferSync U+%04X failed upload (evictPending=%d pages=%zu)",
+                    codepoint, m_evictionPending ? 1 : 0, m_atlasPages.size());
+            }
         }
         m_glyphPool.erase(it);
         return nullptr;

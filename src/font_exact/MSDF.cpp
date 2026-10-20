@@ -246,9 +246,10 @@ namespace {
             // Diagnostics for "missing characters": rate-limited per kind (3D and 2D separately), no fixed cap.
             if (is3d) ++s_stat3dWaiting; else ++s_stat2dWaiting;
             static ULONGLONG s_last2d = 0, s_last3d = 0;
-            if (LogEvery(is3d ? s_last3d : s_last2d, is3d ? 250 : 3000)) {
-                Log("[MSDF] string waiting for glyphs: is3d=%d quads=%u firstMissing=U+%04X why=%d text='%s'",
-                    is3d ? 1 : 0, verts.m_count / 4, missingCp, missingWhy,
+            // 3D: 100ms so short-lived nameplate misses are more likely to appear in the log
+            if (LogEvery(is3d ? s_last3d : s_last2d, is3d ? 100 : 3000)) {
+                Log("[MSDF] string waiting for glyphs: is3d=%d quads=%u firstMissing=U+%04X why=%d preferSync=%d text='%s'",
+                    is3d ? 1 : 0, verts.m_count / 4, missingCp, missingWhy, is3d ? 1 : 0,
                     pThis->m_text ? pThis->m_text : "");
             }
             return;
