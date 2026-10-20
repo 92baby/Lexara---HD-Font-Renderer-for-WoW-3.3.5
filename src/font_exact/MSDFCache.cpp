@@ -1,13 +1,7 @@
 #include "MSDFCache.h"
 #include "MSDFManager.h"
-#include "../ShutdownCheck.h"
 #include <fstream>
 #include <ranges>
-#include <algorithm>
-#include <condition_variable>
-#include <mutex>
-#include <thread>
-#include <unordered_set>
 
 MSDFManager MSDFCache::s_manager = MSDFManager();
 
@@ -27,26 +21,7 @@ MSDFCache::MSDFCache(const FT_Byte* fontData, FT_Long dataSize, const char* fami
 }
 
 MSDFCache::~MSDFCache() {
-    if (m_async && g_isProcessTerminating) {
-        // Process exit: the worker thread may already have been killed, so never wait for it.
-        // Write whatever is still pending right here on the calling thread.
-        FlushPendingWritesAsync(true);
-        SetAsyncWrites(false);
-    }
-    else {
-        FlushPendingWrites();
-        if (m_async) {
-            WaitForAsyncIdle();
-            SetAsyncWrites(false); // unregisters this cache from the worker's result routing
-
-            // Writes only append to the journal while running; compact it into the manifest once it grows.
-            std::error_code ec;
-            if (m_manifestLoaded) {
-                auto jsize = std::filesystem::file_size(m_cacheManifestJournalPath, ec);
-                if (!ec && jsize > 128 * 1024) SaveManifest(false);
-            }
-        }
-    }
+    FlushPendingWrites();
     CleanupOrphans();
     MSDFManager::FlushAll();
     m_vecPool.TrimAll();
@@ -69,34 +44,24 @@ std::string MSDFCache::SanitizeName(std::string_view name) {
     return out.empty() ? "unnamed" : out;
 }
 
-std::filesystem::path MSDFCache::GetCacheBasePath(const char* familyName, const char* styleName,
+std::string MSDFCache::GetCacheBasePath(const char* familyName, const char* styleName,
     uint32_t sdfRenderSize, uint32_t sdfSpread) {
     std::string fam = SanitizeName(familyName);
     std::string sty = SanitizeName(styleName);
     std::string folderName = fam + "_" + sty + "_s" + std::to_string(sdfRenderSize) + "_sp" + std::to_string(sdfSpread);
 
-    // Preferred location: <folder containing wow.exe>\LEXARA\<font folder>.
-    // Falls back to %TEMP% if that folder cannot be created or written (e.g. read-only install location).
-    wchar_t exePath[MAX_PATH * 2] = {};
-    const DWORD n = GetModuleFileNameW(nullptr, exePath, static_cast<DWORD>(std::size(exePath)));
-    if (n > 0 && n < std::size(exePath)) {
-        std::filesystem::path base = std::filesystem::path(exePath).parent_path() / CACHE_DIR / folderName;
-        std::error_code ec;
-        std::filesystem::create_directories(base, ec);
-        if (!ec) {
-            // Make sure we can actually write there.
-            HANDLE h = CreateFileW((base / L".write_test").c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
-                FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, nullptr);
-            if (h != INVALID_HANDLE_VALUE) {
-                CloseHandle(h);
-                return base;
-            }
-        }
+    // 使用 Wow.exe 所在目录，而不是系统 Temp
+    char exePath[MAX_PATH] = {};
+    if (!GetModuleFileNameA(nullptr, exePath, MAX_PATH)) {
+        // 回退到 Temp，避免极端情况下写失败
+        wchar_t tempPath[MAX_PATH] = {};
+        GetTempPathW(MAX_PATH, tempPath);
+        return (std::filesystem::path(tempPath) / CACHE_DIR / folderName).string();
     }
 
-    wchar_t tempPath[MAX_PATH] = {};
-    GetTempPathW(MAX_PATH, tempPath);
-    return std::filesystem::path(tempPath) / CACHE_DIR / folderName;
+    std::filesystem::path gameRoot = std::filesystem::path(exePath).parent_path();
+    std::filesystem::path base = gameRoot / CACHE_DIR / folderName;
+    return base.string();
 }
 
 void MSDFCache::BuildBlockLockPath(uint32_t blockId, std::filesystem::path& outPath) const {
@@ -116,11 +81,8 @@ uint32_t MSDFCache::GetBlockId(uint32_t codepoint) {
 }
 
 bool MSDFCache::TryLoadGlyph(uint32_t codepoint, GlyphMetrics& outMetrics) {
-    if (m_async) DrainAsyncResults();
     auto mit = m_manifest.find(codepoint);
     if (mit == m_manifest.end()) return false;
-    // The block file is being replaced by the worker: report a miss (the glyph is simply regenerated).
-    if (m_async && !m_inflightBlocks.empty() && m_inflightBlocks.contains(mit->second.blockId)) return false;
     auto bit = m_blockWrap.find(mit->second.blockId);
     if (bit != m_blockWrap.end()) {
         return MSDFManager::LoadGlyph(bit->second, codepoint, outMetrics);
@@ -135,7 +97,6 @@ bool MSDFCache::TryLoadGlyph(uint32_t codepoint, GlyphMetrics& outMetrics) {
 }
 
 bool MSDFCache::StoreGlyph(GlyphMetricsToStore&& metrics) {
-    if (m_async) DrainAsyncResults();
     if (!m_manifestLoaded) {
         if (!LoadManifest()) return false;
     }
@@ -313,7 +274,6 @@ size_t MSDFCache::GetManifestSize() {
 
 bool MSDFCache::FlushPendingWrites() {
     if (m_pendingWrites.empty()) return true;
-    if (m_async) return FlushPendingWritesAsync();
 
     std::error_code ec;
     std::filesystem::create_directories(m_cacheBasePath, ec);
@@ -530,344 +490,4 @@ void MSDFCache::CleanupOrphans() const {
             }
         }
     }
-}
-
-
-// ============================================================================
-// Background writes
-// ============================================================================
-
-struct MSDFCache::AsyncState {
-    std::mutex mtx;
-    std::condition_variable cv;
-    std::deque<AsyncJob> jobs;
-    std::vector<AsyncResult> results;
-    std::unordered_set<MSDFCache*> liveOwners; // caches that may still receive results
-    std::atomic<bool> hasResults{ false };
-    bool workerStarted = false;
-};
-
-MSDFCache::AsyncState& MSDFCache::GetAsyncState() {
-    // Intentionally leaked: the detached worker thread may outlive static destruction.
-    static AsyncState* state = new AsyncState();
-    return *state;
-}
-
-void MSDFCache::SetAsyncWrites(bool enable) {
-    AsyncState& st = GetAsyncState();
-    std::lock_guard<std::mutex> lk(st.mtx);
-    if (enable) st.liveOwners.insert(this);
-    else st.liveOwners.erase(this);
-    m_async = enable;
-}
-
-void MSDFCache::WorkerMain() {
-    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
-    AsyncState& st = GetAsyncState();
-    for (;;) {
-        AsyncJob job;
-        {
-            std::unique_lock<std::mutex> lk(st.mtx);
-            st.cv.wait(lk, [&] { return !st.jobs.empty(); });
-            job = std::move(st.jobs.front());
-            st.jobs.pop_front();
-        }
-
-        AsyncResult res;
-        res.owner = job.owner;
-        res.blockId = job.blockId;
-        if (!ExecuteJob(job, res.entries)) res.entries.clear();
-
-        {
-            std::lock_guard<std::mutex> lk(st.mtx);
-            st.results.push_back(std::move(res));
-            st.hasResults.store(true, std::memory_order_release);
-        }
-    }
-}
-
-bool MSDFCache::FlushPendingWritesAsync(bool inlineMode) {
-    if (m_pendingWrites.empty()) return true;
-
-    std::error_code ec;
-    std::filesystem::create_directories(m_cacheBasePath, ec);
-    if (ec) { m_pendingWrites.clear(); return false; }
-
-    ankerl::unordered_dense::map<uint32_t, std::vector<GlyphMetricsToStore>> byBlock;
-    for (auto& pw : m_pendingWrites) {
-        byBlock[GetBlockId(pw.codepoint)].push_back(std::move(pw));
-    }
-    m_pendingWrites.clear();
-
-    AsyncState& st = GetAsyncState();
-    for (auto& kv : byBlock) {
-        AsyncJob job;
-        job.owner = this;
-        job.blockId = kv.first;
-        BuildBlockPath(kv.first, job.blockPath);
-        BuildBlockLockPath(kv.first, job.blockLockPath);
-        job.manifestLockPath = m_cacheManifestLockPath;
-        job.journalPath = m_cacheManifestJournalPath;
-        job.glyphs = std::move(kv.second);
-
-        // Unmap on this (render) thread so the file can be replaced.
-        // Until the job lands, TryLoadGlyph reports a miss for this block.
-        MSDFManager::FreeBlockByKey(BlockKey(m_fontID, kv.first));
-
-        if (inlineMode) {
-            std::vector<ManifestEntry> ignored;
-            ExecuteJob(job, ignored);
-            continue;
-        }
-
-        ++m_inflightBlocks[kv.first];
-        m_inflightJobs.fetch_add(1, std::memory_order_relaxed);
-
-        {
-            std::lock_guard<std::mutex> lk(st.mtx);
-            st.jobs.push_back(std::move(job));
-            if (!st.workerStarted) {
-                st.workerStarted = true;
-                std::thread(&MSDFCache::WorkerMain).detach();
-            }
-        }
-        st.cv.notify_one();
-    }
-    return true;
-}
-
-void MSDFCache::DrainAsyncResults() {
-    AsyncState& st = GetAsyncState();
-    if (!st.hasResults.load(std::memory_order_acquire)) return;
-
-    std::vector<AsyncResult> local;
-    {
-        std::lock_guard<std::mutex> lk(st.mtx);
-        local.swap(st.results);
-        st.hasResults.store(false, std::memory_order_relaxed);
-    }
-    for (AsyncResult& r : local) {
-        bool alive;
-        {
-            std::lock_guard<std::mutex> lk(st.mtx);
-            alive = st.liveOwners.contains(r.owner);
-        }
-        if (!alive) continue; // owner already destroyed
-
-        MSDFCache* o = r.owner;
-        for (const ManifestEntry& e : r.entries) o->m_manifest[e.codepoint] = e;
-
-        auto it = o->m_inflightBlocks.find(r.blockId);
-        if (it != o->m_inflightBlocks.end() && --it->second == 0) o->m_inflightBlocks.erase(it);
-        o->m_inflightJobs.fetch_sub(1, std::memory_order_relaxed);
-    }
-}
-
-void MSDFCache::WaitForAsyncIdle() {
-    if (g_isProcessTerminating) return; // the worker may be gone
-    const ULONGLONG start = GetTickCount64();
-    while (m_inflightJobs.load(std::memory_order_relaxed) > 0 && GetTickCount64() - start < 15000) {
-        DrainAsyncResults();
-        if (m_inflightJobs.load(std::memory_order_relaxed) == 0) break;
-        Sleep(2);
-    }
-    DrainAsyncResults();
-}
-
-bool MSDFCache::ReadWholeFile(const std::filesystem::path& path, std::vector<uint8_t>& out) {
-    out.clear();
-    FileGuard file(CreateFileW(path.c_str(), GENERIC_READ,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
-        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr));
-    if (!file.IsValid()) return false;
-
-    LARGE_INTEGER size{};
-    if (!GetFileSizeEx(file.handle, &size) || size.QuadPart <= 0 ||
-        static_cast<uint64_t>(size.QuadPart) > MAX_SAFE_ALLOCATION) return false;
-
-    out.resize(static_cast<size_t>(size.QuadPart));
-    size_t done = 0;
-    while (done < out.size()) {
-        DWORD got = 0;
-        if (!ReadFile(file.handle, out.data() + done, static_cast<DWORD>(out.size() - done), &got, nullptr) || got == 0) {
-            out.clear();
-            return false;
-        }
-        done += got;
-    }
-    return true;
-}
-
-bool MSDFCache::AppendJournalFile(const std::filesystem::path& path, const std::vector<ManifestEntry>& entries) {
-    if (entries.empty()) return true;
-    FileGuard file(CreateFileW(path.c_str(), FILE_APPEND_DATA,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-        nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr));
-    if (!file.IsValid()) return false;
-
-    const DWORD totalBytes = static_cast<DWORD>(entries.size() * sizeof(ManifestEntry));
-    DWORD written = 0;
-    const bool ok = WriteFile(file.handle, entries.data(), totalBytes, &written, nullptr) && written == totalBytes;
-    if (ok) FlushFileBuffers(file.handle);
-    return ok;
-}
-
-// Runs on the worker thread. Touches only files and local buffers.
-bool MSDFCache::ExecuteJob(AsyncJob& job, std::vector<ManifestEntry>& outEntries) {
-    // Pending glyphs: sorted by codepoint, last write wins for duplicates.
-    std::stable_sort(job.glyphs.begin(), job.glyphs.end(),
-        [](const GlyphMetricsToStore& a, const GlyphMetricsToStore& b) { return a.codepoint < b.codepoint; });
-    std::vector<const GlyphMetricsToStore*> pend;
-    pend.reserve(job.glyphs.size());
-    for (size_t i = 0; i < job.glyphs.size(); ++i) {
-        if (i + 1 < job.glyphs.size() && job.glyphs[i + 1].codepoint == job.glyphs[i].codepoint) continue;
-        pend.push_back(&job.glyphs[i]);
-    }
-
-    ScopedFileLock blockLock;
-    if (!blockLock.AcquireExclusive(job.blockLockPath, 5000)) return false;
-
-    // Read the existing block (if any) into private memory. Copy entries out with memcpy: the file
-    // buffer is not 64-byte aligned, and GlyphEntry is alignas(64).
-    std::vector<uint8_t> oldFile;
-    std::vector<GlyphEntry> oldEntries;
-    const uint8_t* oldPayload = nullptr;
-    if (ReadWholeFile(job.blockPath, oldFile) && oldFile.size() >= sizeof(BlockFileHeader)) {
-        BlockFileHeader hdr{};
-        std::memcpy(&hdr, oldFile.data(), sizeof(hdr));
-        bool ok = hdr.magic == BLOCK_MAGIC && hdr.version == CACHE_VERSION &&
-            hdr.blockId == job.blockId && hdr.entryCount <= BLOCK_SIZE;
-        size_t payloadOffset = 0;
-        if (ok) {
-            const size_t hashOffset = sizeof(BlockFileHeader) + static_cast<size_t>(hdr.entryCount) * sizeof(GlyphEntry);
-            payloadOffset = hashOffset + BLOCK_SIZE * sizeof(uint32_t);
-            ok = oldFile.size() >= payloadOffset;
-        }
-        if (ok) {
-            oldEntries.resize(hdr.entryCount);
-            if (hdr.entryCount) std::memcpy(oldEntries.data(), oldFile.data() + sizeof(BlockFileHeader), hdr.entryCount * sizeof(GlyphEntry));
-            const size_t maxPayload = oldFile.size() - payloadOffset;
-            for (const GlyphEntry& e : oldEntries) {
-                if (e.dataSize > 0 && static_cast<uint64_t>(e.dataOffset) + e.dataSize > maxPayload) { ok = false; break; }
-            }
-        }
-        if (ok) {
-            oldPayload = oldFile.data() + payloadOffset;
-            std::sort(oldEntries.begin(), oldEntries.end());
-        }
-        else {
-            oldEntries.clear(); // damaged block: start over
-        }
-    }
-
-    // Merge old and pending (pending wins on equal codepoints).
-    struct Src { const uint8_t* ptr; };
-    std::vector<GlyphEntry> merged;
-    std::vector<Src> srcs;
-    merged.reserve(oldEntries.size() + pend.size());
-    srcs.reserve(oldEntries.size() + pend.size());
-    size_t oi = 0, pi = 0;
-    while (oi < oldEntries.size() || pi < pend.size()) {
-        const bool takeOld = oi < oldEntries.size() &&
-            (pi == pend.size() || oldEntries[oi].codepoint < pend[pi]->codepoint);
-        if (takeOld) {
-            merged.push_back(oldEntries[oi]);
-            srcs.push_back({ oldEntries[oi].dataSize > 0 ? oldPayload + oldEntries[oi].dataOffset : nullptr });
-            ++oi;
-        }
-        else {
-            const GlyphMetricsToStore* p = pend[pi++];
-            if (oi < oldEntries.size() && oldEntries[oi].codepoint == p->codepoint) ++oi; // replaced
-            GlyphEntry ge{};
-            ge.codepoint = p->codepoint;
-            ge.width = p->width;
-            ge.height = p->height;
-            ge.bitmapTop = p->bitmapTop;
-            ge.bitmapLeft = p->bitmapLeft;
-            ge.dataOffset = 0;
-            ge.dataSize = p->dataSize;
-            merged.push_back(ge);
-            srcs.push_back({ p->dataSize > 0 ? p->ownedPixelData.data() : nullptr });
-        }
-    }
-    if (merged.size() > BLOCK_SIZE) return false;
-
-    uint64_t totalPayload = 0;
-    for (GlyphEntry& ge : merged) {
-        ge.dataOffset = static_cast<uint32_t>(totalPayload);
-        totalPayload += ge.dataSize;
-    }
-    if (totalPayload > MAX_SAFE_ALLOCATION) return false;
-
-    std::vector<uint32_t> hashTable(BLOCK_SIZE, 0xFFFFFFFFu);
-    for (size_t i = 0; i < merged.size(); ++i) {
-        hashTable[merged[i].codepoint & (BLOCK_SIZE - 1)] = static_cast<uint32_t>(i);
-    }
-
-    SYSTEM_INFO si{};
-    GetSystemInfo(&si);
-    const size_t align = si.dwAllocationGranularity ? si.dwAllocationGranularity : 65536;
-    const size_t dataSize = sizeof(BlockFileHeader) + merged.size() * sizeof(GlyphEntry) +
-        BLOCK_SIZE * sizeof(uint32_t) + static_cast<size_t>(totalPayload);
-    const size_t paddedSize = ((dataSize + align - 1) / align) * align;
-
-    std::vector<uint8_t> payload(static_cast<size_t>(totalPayload) + (paddedSize - dataSize), 0);
-    for (size_t i = 0; i < merged.size(); ++i) {
-        if (srcs[i].ptr && merged[i].dataSize > 0) {
-            std::memcpy(payload.data() + merged[i].dataOffset, srcs[i].ptr, merged[i].dataSize);
-        }
-    }
-
-    std::filesystem::path tmpPath = job.blockPath;
-    tmpPath.replace_extension(".tmp");
-    {
-        FileGuard tmpFile(CreateFileW(tmpPath.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
-            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr));
-        if (!tmpFile.IsValid()) return false;
-        tmpFile.path = tmpPath;
-        tmpFile.deleteOnFailure = true;
-
-        BlockFileHeader bHdr{};
-        bHdr.magic = BLOCK_MAGIC;
-        bHdr.version = CACHE_VERSION;
-        bHdr.blockId = job.blockId;
-        bHdr.entryCount = static_cast<uint32_t>(merged.size());
-
-        DWORD written = 0;
-        auto put = [&](const void* data, size_t bytes) {
-            return bytes == 0 || (WriteFile(tmpFile.handle, data, static_cast<DWORD>(bytes), &written, nullptr) && written == bytes);
-        };
-        if (!put(&bHdr, sizeof(bHdr)) ||
-            !put(merged.data(), merged.size() * sizeof(GlyphEntry)) ||
-            !put(hashTable.data(), hashTable.size() * sizeof(uint32_t)) ||
-            !put(payload.data(), payload.size())) {
-            return false;
-        }
-        FlushFileBuffers(tmpFile.handle);
-        tmpFile.successful = true;
-    }
-
-    // The render thread unmapped this block when the job was queued and does not remap it until we finish,
-    // so the replace normally succeeds at once. Another game instance may still hold a mapping: retry briefly.
-    bool moved = false;
-    for (int attempt = 0; attempt < 5 && !moved; ++attempt) {
-        moved = MoveFileExW(tmpPath.c_str(), job.blockPath.c_str(), MOVEFILE_REPLACE_EXISTING) != 0;
-        if (!moved) Sleep(40);
-    }
-    if (!moved) {
-        DeleteFileW(tmpPath.c_str());
-        return false;
-    }
-
-    outEntries.reserve(pend.size());
-    for (const GlyphMetricsToStore* p : pend) {
-        outEntries.push_back({ p->codepoint, job.blockId });
-    }
-
-    // Best effort: record in the journal so future sessions know about these glyphs.
-    ScopedFileLock manifestLock;
-    if (manifestLock.AcquireExclusive(job.manifestLockPath, 5000)) {
-        AppendJournalFile(job.journalPath, outEntries);
-    }
-    return true;
 }

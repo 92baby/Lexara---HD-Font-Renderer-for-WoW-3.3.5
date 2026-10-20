@@ -1,4 +1,3 @@
-#include "../Logger.h"
 #include "MSDF.h"
 #include "MSDFFont.h"
 #include "MSDFCache.h"
@@ -10,41 +9,6 @@
 
 namespace {
     uint32_t g_runtimeVBSize = 0;
-
-    // 3D text (names above heads): glyph quads are padded by the SDF spread, so neighbouring quads (and the
-    // shadow copy) overlap in the same plane. With depth writes on, which quad wins the depth test depends on
-    // float rounding, i.e. on the camera angle -> glyphs vanish / flicker. So depth writes are turned off
-    // for 3D MSDF text, right before each draw call (the game may re-set the state at any time).
-    //
-    // Hotkeys for A/B comparison (Ctrl+Shift held, so they do not collide with game key bindings):
-    //   Ctrl+Shift+F9  = toggle: sample atlas at mip level 0 only
-    //   Ctrl+Shift+F10 = toggle: depth-write-off for 3D text (default ON)
-    bool s_diagNoMip = false;
-    bool s_diagNoZWrite = true;
-    bool s_text3dActive = false;
-    bool s_diagZSaved = false;
-    DWORD s_diagSavedZ = TRUE;
-
-    void DiagPollKeys() {
-        static bool d9 = false, d10 = false;
-        const bool mods = (GetAsyncKeyState(VK_CONTROL) & 0x8000) && (GetAsyncKeyState(VK_SHIFT) & 0x8000);
-        const bool k9 = mods && (GetAsyncKeyState(VK_F9) & 0x8000) != 0;
-        const bool k10 = mods && (GetAsyncKeyState(VK_F10) & 0x8000) != 0;
-        if (k9 && !d9) { s_diagNoMip = !s_diagNoMip; Log("[DIAG] F9: noMip = %d", s_diagNoMip ? 1 : 0); }
-        if (k10 && !d10) { s_diagNoZWrite = !s_diagNoZWrite; Log("[DIAG] F10: noZWrite = %d", s_diagNoZWrite ? 1 : 0); }
-        d9 = k9; d10 = k10;
-    }
-
-    // 统一的深度写入恢复入口：只有成功保存过原始状态时才恢复，避免恢复无效值。
-    void RestoreDiagZWrite(IDirect3DDevice9* dev) {
-        if (!s_diagZSaved) return;
-
-        if (dev) {
-            dev->SetRenderState(D3DRS_ZWRITEENABLE, s_diagSavedZ);
-        }
-
-        s_diagZSaved = false;
-    }
 
     IDirect3DPixelShader9* s_cachedPS = nullptr;
     IDirect3DVertexShader9* s_cachedVS = nullptr;
@@ -82,40 +46,6 @@ namespace {
     bool s_msdfInitHookArmed = false;
     std::vector<uint32_t> s_prefetchPayload;
 
-    // CGxString::m_flags high byte:
-    //   bit 31 : geometry processed ("stamped")
-    //   bit 30 : pending (0x40000000, set by InitializeTextLine)
-    //   bits 24-29 : unused. Whether a stamped string is still valid is tracked by MSDFFont
-    //                (per-string tile mask + eviction log), not by a version number in the flags.
-    constexpr uint32_t kPendingFlag = 0x40000000;
-
-    // 把 UTF-8 文本解码为 Unicode 码点（中文客户端文本为 UTF-8 多字节）
-    void AppendUtf8Codepoints(const char* text, std::vector<uint32_t>& out) {
-        const uint8_t* s = reinterpret_cast<const uint8_t*>(text);
-        while (*s) {
-            uint32_t cp = 0;
-            int n = 0;
-            if (*s < 0x80)               { cp = *s;        n = 1; }
-            else if ((*s & 0xE0) == 0xC0) { cp = *s & 0x1F; n = 2; }
-            else if ((*s & 0xF0) == 0xE0) { cp = *s & 0x0F; n = 3; }
-            else if ((*s & 0xF8) == 0xF0) { cp = *s & 0x07; n = 4; }
-            else { ++s; continue; }
-
-            int i = 1;
-            for (; i < n && (s[i] & 0xC0) == 0x80; ++i) {
-                cp = (cp << 6) | (s[i] & 0x3F);
-            }
-            if (i < n) { s += i; continue; } // 非法或被截断的序列
-            out.push_back(cp);
-            s += n;
-        }
-    }
-
-    // Called from the asm hook: run evictions deferred from the previous batch before validating strings
-    void __cdecl FlushFontEvictions() {
-        MSDFFont::FlushPendingEvictions();
-    }
-
     void __cdecl PrefetchCodepoints(CGxString* pThis) {
         if (s_prefetchPayload.empty()) return;
         if (!pThis || reinterpret_cast<uintptr_t>(pThis) & 1) return;
@@ -131,36 +61,10 @@ namespace {
     }
 
     void __fastcall ProcessGeometry(CGxString* pThis) {
+        if (!(pThis->m_flags & 0x40000000)) return;
+
         MSDFFont* fontHandle = MSDFFont::Get(pThis->GetFontFace());
         if (!fontHandle) return;
-
-        // Already stamped and not pending -> nothing to do. Strings whose tiles were evicted are
-        // detected and rebuilt by CheckGeometryHk; never re-stamp them here or stale UVs would be locked in.
-        // Only "pending" strings, or strings with neither stamp nor pending bit (just rebuilt), are scanned.
-        {
-            const uint32_t hi = pThis->m_flags >> 24;
-            if ((hi & 0x80) && !(hi & 0x40)) {
-                // DIAG: a stamped string must contain no unprocessed quads (u > 1). If it does, the game rebuilt
-                // the geometry without going through InitializeTextLine, and those glyphs will render empty.
-                CGxFontGeomBatch* b = pThis->m_geomBuffers[0];
-                if (b && b->m_verts.m_data && b->m_verts.m_count >= 4) {
-                    uint32_t bad = 0;
-                    for (uint32_t q = 0; q < b->m_verts.m_count; q += 4) {
-                        if (b->m_verts.m_data[q].u > 1.0f) ++bad;
-                    }
-                    static int s_n = 0;
-                    if (bad && s_n < 100) {
-                        ++s_n;
-                        Log("[DIAG] STAMPED string has %u/%u unprocessed quads, is3d=%d, flags=%08X, text='%s'",
-                            bad, b->m_verts.m_count / 4, (pThis->m_flags & 0x80) ? 1 : 0, pThis->m_flags,
-                            pThis->m_text ? pThis->m_text : "");
-                    }
-                }
-                return;
-            }
-        }
-        fontHandle->BeginString(pThis);
-        uint32_t tileMask = 0;
 
         CGxFontGeomBatch* batch = pThis->m_geomBuffers[0];
         if (!batch || batch->m_verts.m_count < 4) return;
@@ -177,21 +81,18 @@ namespace {
         // 去掉 0.98 缩放，减少中文被压缩导致的裁切
         const double scale = (is3d ? fontSizeMult : CGxuFont::GetFontEffectiveHeight(is3d, fontSizeMult) * 1.0) / MSDF::SDF_RENDER_SIZE;
         const double pad = MSDF::SDF_SPREAD * scale;
-        bool incomplete = false; // 有字形暂时拿不到 -> 不盖章，下一帧重试
-        uint32_t missingCp = 0;  // DIAG: first codepoint that could not be resolved
-        int missingWhy = 0;      // DIAG: 1 = no MSDF glyph, 2 = no game glyph entry
 
+        bool incomplete = false;
         for (uint32_t q = 0; q < verts.m_count; q += 4) {
             CGxFontVertex* vBase = &verts.m_data[q];
             if (vBase[0].u > 1.0f) {
                 const uint32_t codepoint = vBase[0].u - 1.0f;
 
                 const GlyphMetrics* gm = fontHandle->GetGlyph(codepoint);
-                if (!gm) { incomplete = true; if (!missingCp) { missingCp = codepoint; missingWhy = 1; } continue; }
+                if (!gm) { incomplete = true; continue; }
 
                 CGxGlyphCacheEntry* entry = fontObj->GetOrCreateGlyphEntry(codepoint);
-                if (!entry) { incomplete = true; if (!missingCp) { missingCp = codepoint; missingWhy = 2; } continue; }
-                if (gm->atlasTile != 0xFF) tileMask |= 1u << gm->atlasTile;
+                if (!entry) { incomplete = true; continue; }
 
                 CGxFontVertex* vert0 = &vBase[0];
                 CGxFontVertex* vert1 = &vBase[1];
@@ -201,14 +102,22 @@ namespace {
                 const double leftOffs = fontObj->GetBearingX(entry, is3d, fontSizeMult);
                 const double bitmapLeft = is3d ? leftOffs : gm->bitmapLeft * scale - leftOffs;
 
-                // 使用 MSDF 的真实宽度，不再钳制左右边界：
-                // 钳制会改变四边形宽度而 UV 不变，造成字形横向压缩/裁切。
-                // 四边形外圈的 padding 在 SDF 中是透明的，重叠不影响显示。
+                // 尽量沿用引擎已排好的左右边界，减少右边被切和中间重叠
                 const double origLeft  = static_cast<double>(vert0->pos.X);
+                const double origRight = static_cast<double>(vert2->pos.X);
                 const double msdfWidth = gm->width * scale;
 
-                const double newLeft  = origLeft + (bitmapLeft != leftOffs ? bitmapLeft + 1.0 : 0.0) - pad + fontOffs * 0.5;
-                const double newRight = newLeft + msdfWidth;
+                double newLeft  = origLeft + (bitmapLeft != leftOffs ? bitmapLeft + 1.0 : 0.0) - pad + fontOffs * 0.5;
+                double newRight = newLeft + msdfWidth;
+
+                // 若 MSDF 比原布局更宽，向右扩展，避免右边被切
+                if (newRight > origRight) {
+                    newRight = origRight + pad;
+                }
+                // 防止左边过度左移导致与前一字重叠
+                if (newLeft > origLeft) {
+                    newLeft = origLeft;
+                }
 
                 const double newTop = static_cast<double>(vert1->pos.Y) + (gm->bitmapTop * scale) + pad - baselineOffs;
                 const double newBottom = newTop - (gm->height * scale);
@@ -232,42 +141,24 @@ namespace {
                 vert3->u = u1 * uSign; vert3->v = v1 * vSign;
             }
         }
+        // Incomplete: leave pending bit set so next frame retries; do not stamp version
+        if (incomplete) return;
 
-        // 有字形没拿到：保留现有标记、不盖版本章，下一帧 CheckGeometry 会再次进来重试
-        // Remember which tiles this string uses (also for partial passes, so a later eviction is noticed).
-        fontHandle->AccumulateString(pThis, tileMask, !incomplete);
-
-        // Some glyphs unavailable: keep the pending bit and do not stamp; retried next frame.
-        if (incomplete) {
-            // Diagnostics for "missing characters": how often does a string have to wait for glyphs?
-            static int s_incompleteLogged = 0;
-            if (s_incompleteLogged < 300) {
-                ++s_incompleteLogged;
-                Log("[MSDF] string waiting for glyphs: is3d=%d quads=%u firstMissing=U+%04X why=%d text='%s' (#%d)",
-                    is3d ? 1 : 0, verts.m_count / 4, missingCp, missingWhy,
-                    pThis->m_text ? pThis->m_text : "", s_incompleteLogged);
-            }
-            return;
-        }
-
-        // Stamp = processed. Validity is tracked by MSDFFont (tile mask + eviction log), not by the token.
-        pThis->m_flags = (pThis->m_flags & 0x00FFFFFF) | (0x80u << 24);
+        // Version token uses only 6 bits (0x3F) to avoid colliding with 0x40000000 (bit 30)
+        const uint32_t versionToken = (fontHandle->GetAtlasEvictionCount() & 0x3F) | 0x80;
+        pThis->m_flags = (pThis->m_flags & 0x00FFFFFF) | (versionToken << 24);
     }
 
     bool __fastcall CGxString__CheckGeometryHk(CGxString* pThis) {
         if (MSDFFont* fontHandle = MSDFFont::Get(pThis->GetFontFace())) {
-            const bool stamped = ((pThis->m_flags >> 24) & 0x80) != 0;
-            // Stale = a tile this string uses has been evicted since it was built: rebuild it.
-            // Strings that use only surviving tiles stay valid and are not rebuilt.
-            if (fontHandle->CheckString(pThis, stamped) == MSDFFont::StringState::Stale) {
-                static int s_staleLogged = 0;
-                if (s_staleLogged < 100) {
-                    ++s_staleLogged;
-                    Log("[DIAG] string stale -> rebuild: is3d=%d stamped=%d text='%s' (#%d)",
-                        (pThis->m_flags & 0x80) ? 1 : 0, stamped ? 1 : 0, pThis->m_text ? pThis->m_text : "", s_staleLogged);
+            uint32_t highByte = (pThis->m_flags >> 24) & 0xFF;
+            if ((highByte & 0x80) != 0) {
+                uint8_t storedVersion = highByte & 0x3F;
+                uint8_t currentVersion = static_cast<uint8_t>(fontHandle->GetAtlasEvictionCount() & 0x3F);
+                if (storedVersion != currentVersion) {
+                    pThis->ClearInstanceData();
+                    pThis->m_flags &= 0x00FFFFFF;
                 }
-                pThis->ClearInstanceData();
-                pThis->m_flags &= 0x00FFFFFF;
             }
         }
         CGxFontGeomBatch* batch = pThis->m_geomBuffers[0];
@@ -302,11 +193,7 @@ namespace {
                 device->SetSamplerState(slot, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
                 device->SetSamplerState(slot, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
                 device->SetSamplerState(slot, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
-                // Auto-generated mipmaps report GetLevelCount() == 1, so use the font's flag instead.
-                // Trilinear when mips exist (the shader picks the LOD via tex2Dlod); pages without mips just use level 0.
-                device->SetSamplerState(slot, D3DSAMP_MIPFILTER, (MSDFFont::IsAutoMipEnabled() && !s_diagNoMip) ? D3DTEXF_LINEAR : D3DTEXF_NONE);
-                device->SetSamplerState(slot, D3DSAMP_MIPMAPLODBIAS, 0);
-                device->SetSamplerState(slot, D3DSAMP_MAXMIPLEVEL, 0);
+                device->SetSamplerState(slot, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
             }
         }
 
@@ -319,18 +206,10 @@ namespace {
         };
         device->SetPixelShaderConstantF(MSDF::SDF_SAMPLER_SLOT, controlFlag, 1);
         device->SetVertexShaderConstantF(MSDF::SDF_SAMPLER_SLOT, controlFlag, 1);
-
-        s_text3dActive = is3d; // the draw callback (registered in FreeType_InitHk) acts on this
     }
 
     void __fastcall CGxuFontRenderBatchHk(CGxuFont* pThis) {
-        DiagPollKeys();
-
         pThis->RenderBatch();
-
-        s_text3dActive = false;
-        RestoreDiagZWrite(D3D::GetDevice());
-
         if (IDirect3DDevice9* device = D3D::GetDevice()) {
             constexpr float resetControl[4] = { 0, 0, 0, 0 };
             device->SetPixelShaderConstantF(MSDF::SDF_SAMPLER_SLOT, resetControl, 1);
@@ -364,18 +243,33 @@ namespace {
     int __fastcall CGxString__InitializeTextLineHk(CGxString* pThis, void* edx, char* text, int textLength, int* a4, C3Vector* startPos, void* a6, int a7) {
         const int result = pThis->InitializeTextLine(text, textLength, a4, startPos, a6, a7);
 
-        if (pThis->m_flags & kPendingFlag) return result;
-        if (pThis->m_text) {
-            AppendUtf8Codepoints(pThis->m_text, s_prefetchPayload);
+        if (pThis->m_flags & 0x40000000) return result;
+        // Decode real UTF-8 codepoints (Chinese is multi-byte)
+        const uint8_t* s = reinterpret_cast<const uint8_t*>(pThis->m_text);
+        if (s) {
+            while (*s) {
+                uint32_t cp;
+                int n;
+                if (*s < 0x80) { cp = *s; n = 1; }
+                else if ((*s & 0xE0) == 0xC0) { cp = *s & 0x1F; n = 2; }
+                else if ((*s & 0xF0) == 0xE0) { cp = *s & 0x0F; n = 3; }
+                else if ((*s & 0xF8) == 0xF0) { cp = *s & 0x07; n = 4; }
+                else { ++s; continue; }
+                int i = 1;
+                for (; i < n && (s[i] & 0xC0) == 0x80; ++i)
+                    cp = (cp << 6) | (s[i] & 0x3F);
+                if (i < n) { s += i; continue; }
+                s_prefetchPayload.push_back(cp);
+                s += n;
+            }
         }
-        pThis->m_flags |= kPendingFlag;
+        pThis->m_flags |= 0x40000000;
         return result;
     }
 
     __declspec(naked) void CGxString__CheckGeometry_siteHk() {
         __asm {
             pushad;
-            call FlushFontEvictions;
             mov edi, ebx;
 
             test ebx, ebx;
@@ -614,28 +508,6 @@ namespace {
             Hooks::Detour(&CGxString::WriteGeometryFn, CGxString__WriteGeometryHk);
             Hooks::Detour(&CGxString::InitializeTextLineFn, CGxString__InitializeTextLineHk);
             DetourTransactionCommit();
-
-            D3D::RegisterDrawIndexedPrimitiveCallback(
-                [](IDirect3DDevice9* dev,
-                   D3DPRIMITIVETYPE,
-                   INT, UINT, UINT, UINT, UINT) {
-
-                    if (!s_text3dActive || !s_diagNoZWrite) return;
-
-                    if (!s_diagZSaved) {
-                        DWORD savedZ = TRUE;
-
-                        if (FAILED(dev->GetRenderState(
-                                D3DRS_ZWRITEENABLE, &savedZ))) {
-                            return;
-                        }
-
-                        s_diagSavedZ = savedZ;
-                        s_diagZSaved = true;
-                    }
-
-                    dev->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
-                });
 
             D3D::RegisterOnDestroy([]() {
                 if (s_cachedPS) { s_cachedPS->Release(); s_cachedPS = nullptr; }
