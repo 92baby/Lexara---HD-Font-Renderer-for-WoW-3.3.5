@@ -9,6 +9,8 @@ MSDFFont::MSDFFont(FT_Face face, const FT_Byte* fontData, FT_Long dataSize)
     : m_ftFace(face), m_msdfFont(nullptr), m_isValid(false), m_evictionCount(0)
 {
     if (!face) return;
+    m_fontData = fontData;
+    m_fontDataSize = dataSize;
 
     m_msdfFont = CreateMSDFHandle(fontData, dataSize);
     if (!m_msdfFont) return;
@@ -26,6 +28,7 @@ MSDFFont::MSDFFont(FT_Face face, const FT_Byte* fontData, FT_Long dataSize, FT_L
 }
 
 MSDFFont::~MSDFFont() {
+    StopGenWorkers();
     m_glyphPool.clear();
     m_atlasPages.clear();
     m_cache.reset();
@@ -49,6 +52,8 @@ void MSDFFont::Register(FT_Face face, const FT_Byte* data, FT_Long size) {
     if (font->m_msdfFont && font->m_isValid) {
         // Runtime fonts write their disk cache on a background thread (pre-generation stays synchronous).
         font->m_cache->SetAsyncWrites(true);
+        // Cache misses are generated on worker threads (pre-generation keeps the synchronous path).
+        font->EnableAsyncGeneration();
         s_fontHandles[face] = std::move(font);
     }
 }
@@ -189,50 +194,26 @@ const GlyphMetrics* MSDFFont::GetGlyph(uint32_t codepoint) {
     GlyphMetricsToStore storage;
     storage.codepoint = codepoint;
 
-    if (FT_Set_Pixel_Sizes(m_ftFace, MSDF::SDF_RENDER_SIZE, MSDF::SDF_RENDER_SIZE) != 0) {
-        m_glyphPool.erase(it);
-        return nullptr;
-    }
-
-    FT_UInt glyphIndex = FT_Get_Char_Index(m_ftFace, codepoint);
-    if (FT_Load_Glyph(m_ftFace, glyphIndex, FT_LOAD_NO_BITMAP | FT_LOAD_NO_HINTING) != 0) {
-        m_glyphPool.erase(it);
-        return nullptr;
-    }
-
     bool uploadFailed = false;
-    storage.bitmapLeft = m_ftFace->glyph->bitmap_left;
-    storage.bitmapTop = m_ftFace->glyph->bitmap_top;
+    bool fromWorker = false;   // pixels were produced by a worker thread
+    bool alreadyStored = false;
+    GenResult keep;            // copy kept if the atlas had no room for a worker result
 
-    const bool hasOutline = m_ftFace->glyph->format == FT_GLYPH_FORMAT_OUTLINE &&
-        m_ftFace->glyph->outline.n_contours > 0;
-    if (hasOutline) {
-        FT_BBox bbox;
-        FT_Outline_Get_BBox(&m_ftFace->glyph->outline, &bbox);
-
-        uint16_t w = static_cast<uint16_t>(std::max(0, static_cast<int>(((bbox.xMax + 63) >> 6) - (bbox.xMin >> 6))));
-        uint16_t h = static_cast<uint16_t>(std::max(0, static_cast<int>(((bbox.yMax + 63) >> 6) - (bbox.yMin >> 6))));
-
-        if (w > 0 && h > 0) {
-            uint16_t sdfW = w + 2 * MSDF::SDF_SPREAD;
-            uint16_t sdfH = h + 2 * MSDF::SDF_SPREAD;
-
-            // Check the atlas has room BEFORE generating, so no CPU is wasted on a glyph that cannot be placed.
-            // Mark eviction as pending; it runs at the start of the next batch.
-            AtlasTiles::Slot probe;
-            const AtlasTiles::Result room = AllocateSlot(sdfW, sdfH, probe);
-            if (room != AtlasTiles::Result::Ok) {
-                if (room == AtlasTiles::Result::Full) m_evictionPending = true;
-                static int s_n = 0;
-                if (s_n < 200) { ++s_n; Log("[DIAG] no atlas slot for U+%04X: %s (pages=%zu)", codepoint, room == AtlasTiles::Result::Full ? "FULL" : "PAGE_FAILED", m_atlasPages.size()); }
-                m_glyphPool.erase(it);
-                return nullptr;
-            }
-
-            storage.ownedPixelData.reserve(static_cast<size_t>(sdfW) * sdfH * 4);
-            if (GenerateMSDF(storage.ownedPixelData, codepoint, sdfW, sdfH)) {
-                storage.width = sdfW;
-                storage.height = sdfH;
+    if (m_asyncGen) {
+        DrainGenResults();
+        auto dit = m_done.find(codepoint);
+        if (dit != m_done.end()) {
+            GenResult res = std::move(dit->second);
+            m_done.erase(dit);
+            fromWorker = true;
+            alreadyStored = res.stored;
+            storage.bitmapLeft = res.job.bitmapLeft;
+            storage.bitmapTop = res.job.bitmapTop;
+            if (res.ok) {
+                keep.job = res.job; keep.ok = true; keep.ms = res.ms; keep.pixels = res.pixels; // small (<= ~100 KB)
+                storage.width = static_cast<uint16_t>(res.job.sdfW);
+                storage.height = static_cast<uint16_t>(res.job.sdfH);
+                storage.ownedPixelData = std::move(res.pixels);
                 storage.dataSize = static_cast<uint32_t>(storage.ownedPixelData.size());
                 metrics.width = storage.width;
                 metrics.height = storage.height;
@@ -240,30 +221,208 @@ const GlyphMetrics* MSDFFont::GetGlyph(uint32_t codepoint) {
                 metrics.bitmapTop = storage.bitmapTop;
                 metrics.pixelData = storage.ownedPixelData.data();
                 uploadFailed = !UploadGlyphToAtlas(metrics, codepoint);
+                static int s_ns = 0;
+                if (res.ms > 8.0 && s_ns < 100) { ++s_ns; Log("[DIAG] background glyph generation U+%04X: %.1f ms (off render thread)", codepoint, res.ms); }
             } else {
                 static int s_n = 0;
-                if (s_n < 200) { ++s_n; Log("[DIAG] GenerateMSDF FAILED for U+%04X (sdf %dx%d, glyphIndex=%u) -> stored as blank", codepoint, sdfW, sdfH, glyphIndex); }
+                if (s_n < 200) { ++s_n; Log("[DIAG] GenerateMSDF FAILED for U+%04X (background) -> stored as blank", codepoint); }
             }
+        } else if (m_inflight.count(codepoint)) {
+            // A worker is on it: callers retry on later frames.
+            m_glyphPool.erase(it);
+            return nullptr;
         }
     }
-    {
+
+    if (!fromWorker) {
+        if (FT_Set_Pixel_Sizes(m_ftFace, MSDF::SDF_RENDER_SIZE, MSDF::SDF_RENDER_SIZE) != 0) {
+            m_glyphPool.erase(it);
+            return nullptr;
+        }
+
+        FT_UInt glyphIndex = FT_Get_Char_Index(m_ftFace, codepoint);
+        if (FT_Load_Glyph(m_ftFace, glyphIndex, FT_LOAD_NO_BITMAP | FT_LOAD_NO_HINTING) != 0) {
+            m_glyphPool.erase(it);
+            return nullptr;
+        }
+
+        storage.bitmapLeft = m_ftFace->glyph->bitmap_left;
+        storage.bitmapTop = m_ftFace->glyph->bitmap_top;
+
+        const bool hasOutline = m_ftFace->glyph->format == FT_GLYPH_FORMAT_OUTLINE &&
+            m_ftFace->glyph->outline.n_contours > 0;
+        if (hasOutline) {
+            FT_BBox bbox;
+            FT_Outline_Get_BBox(&m_ftFace->glyph->outline, &bbox);
+
+            uint16_t w = static_cast<uint16_t>(std::max(0, static_cast<int>(((bbox.xMax + 63) >> 6) - (bbox.xMin >> 6))));
+            uint16_t h = static_cast<uint16_t>(std::max(0, static_cast<int>(((bbox.yMax + 63) >> 6) - (bbox.yMin >> 6))));
+
+            if (w > 0 && h > 0) {
+                uint16_t sdfW = w + 2 * MSDF::SDF_SPREAD;
+                uint16_t sdfH = h + 2 * MSDF::SDF_SPREAD;
+
+                // Check the atlas has room BEFORE generating, so no CPU is wasted on a glyph that cannot be placed.
+                // Mark eviction as pending; it runs at the start of the next batch.
+                AtlasTiles::Slot probe;
+                const AtlasTiles::Result room = AllocateSlot(sdfW, sdfH, probe);
+                if (room != AtlasTiles::Result::Ok) {
+                    if (room == AtlasTiles::Result::Full) m_evictionPending = true;
+                    static int s_n = 0;
+                    if (s_n < 200) { ++s_n; Log("[DIAG] no atlas slot for U+%04X: %s (pages=%zu)", codepoint, room == AtlasTiles::Result::Full ? "FULL" : "PAGE_FAILED", m_atlasPages.size()); }
+                    m_glyphPool.erase(it);
+                    return nullptr;
+                }
+
+                if (m_asyncGen && sdfW <= 512 && sdfH <= 512) {
+                    // Hand the expensive part to a worker thread; the render thread only uploads the result later.
+                    StartGenWorkers();
+                    if (!m_genThreads.empty()) {
+                        GenJob job;
+                        job.codepoint = codepoint;
+                        job.sdfW = sdfW; job.sdfH = sdfH;
+                        job.bitmapLeft = storage.bitmapLeft; job.bitmapTop = storage.bitmapTop;
+                        {
+                            std::lock_guard<std::mutex> lk(m_gen->mtx);
+                            m_gen->jobs.push_back(job);
+                        }
+                        m_gen->cv.notify_one();
+                        m_inflight.insert(codepoint);
+                        m_glyphPool.erase(it);
+                        return nullptr;
+                    }
+                }
+
+                storage.ownedPixelData.reserve(static_cast<size_t>(sdfW) * sdfH * 4);
+                if (GenerateMSDF(storage.ownedPixelData, codepoint, sdfW, sdfH)) {
+                    storage.width = sdfW;
+                    storage.height = sdfH;
+                    storage.dataSize = static_cast<uint32_t>(storage.ownedPixelData.size());
+                    metrics.width = storage.width;
+                    metrics.height = storage.height;
+                    metrics.bitmapLeft = storage.bitmapLeft;
+                    metrics.bitmapTop = storage.bitmapTop;
+                    metrics.pixelData = storage.ownedPixelData.data();
+                    uploadFailed = !UploadGlyphToAtlas(metrics, codepoint);
+                } else {
+                    static int s_n = 0;
+                    if (s_n < 200) { ++s_n; Log("[DIAG] GenerateMSDF FAILED for U+%04X (sdf %dx%d, glyphIndex=%u) -> stored as blank", codepoint, sdfW, sdfH, glyphIndex); }
+                }
+            }
+        }
         LARGE_INTEGER t1, fq; QueryPerformanceCounter(&t1); QueryPerformanceFrequency(&fq);
         const double ms = (t1.QuadPart - diagT0.QuadPart) * 1000.0 / static_cast<double>(fq.QuadPart);
         static int s_ns = 0;
-        if (ms > 8.0 && s_ns < 100) { ++s_ns; Log("[DIAG] slow glyph generation U+%04X: %.1f ms", codepoint, ms); }
-        if (metrics.width == 0 && codepoint >= 0x2E80) {
-            static int s_nb = 0;
-            if (s_nb < 200) { ++s_nb; Log("[DIAG] generated glyph U+%04X is BLANK (width=0, glyphIndex=%u)", codepoint, glyphIndex); }
-        }
+        if (ms > 8.0 && s_ns < 100) { ++s_ns; Log("[DIAG] slow glyph generation U+%04X: %.1f ms (render thread)", codepoint, ms); }
     }
+
+    if (metrics.width == 0 && codepoint >= 0x2E80) {
+        static int s_nb = 0;
+        if (s_nb < 200) { ++s_nb; Log("[DIAG] generated glyph U+%04X is BLANK (width=0)", codepoint); }
+    }
+
     // Always store into the disk cache, whether or not the upload succeeded
-    m_cache->StoreGlyph(std::move(storage));
+    if (!alreadyStored) {
+        m_cache->StoreGlyph(std::move(storage));
+    }
 
     if (uploadFailed) {
+        // A worker result that found no atlas room is kept (marked as stored) so it is not generated again.
+        if (fromWorker && keep.ok) {
+            keep.stored = true;
+            m_done[codepoint] = std::move(keep);
+        }
         m_glyphPool.erase(it);
         return nullptr;
     }
     return &metrics;
+}
+
+void MSDFFont::StartGenWorkers() {
+    if (m_gen) return;
+    m_gen = std::make_shared<GenState>();
+    m_gen->data = m_fontData;
+    m_gen->size = m_fontDataSize;
+
+    const unsigned hw = std::thread::hardware_concurrency();
+    const unsigned n = std::clamp<unsigned>(hw > 1 ? hw - 1 : 1, 1u, 3u);
+    for (unsigned i = 0; i < n; ++i) {
+        try {
+            m_genThreads.emplace_back(&MSDFFont::GenWorkerMain, m_gen);
+        } catch (...) {
+            break;
+        }
+    }
+    if (m_genThreads.empty()) Log("[DIAG] could not start glyph worker threads; generating on the render thread");
+    else Log("[MSDF] glyph generation: %zu background worker thread(s) for this font", m_genThreads.size());
+}
+
+void MSDFFont::StopGenWorkers() {
+    if (!m_gen) return;
+    {
+        std::lock_guard<std::mutex> lk(m_gen->mtx);
+        m_gen->stop = true;
+    }
+    m_gen->cv.notify_all();
+    for (std::thread& t : m_genThreads) {
+        if (!t.joinable()) continue;
+        // At process exit the OS may already have killed the workers: never wait for them.
+        if (g_isProcessTerminating) t.detach();
+        else t.join();
+    }
+    m_genThreads.clear();
+}
+
+void MSDFFont::DrainGenResults() {
+    if (!m_gen || !m_gen->hasResults.load(std::memory_order_acquire)) return;
+    std::vector<GenResult> local;
+    {
+        std::lock_guard<std::mutex> lk(m_gen->mtx);
+        local.swap(m_gen->results);
+        m_gen->hasResults.store(false, std::memory_order_relaxed);
+    }
+    for (GenResult& r : local) {
+        m_inflight.erase(r.job.codepoint);
+        const uint32_t cp = r.job.codepoint;
+        m_done[cp] = std::move(r);
+    }
+}
+
+void MSDFFont::GenWorkerMain(std::shared_ptr<GenState> st) {
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+
+    // Every worker owns its FreeType library and font face: msdfgen/FreeType objects are not shared across threads.
+    msdfgen::FreetypeHandle* ft = msdfgen::initializeFreetype();
+    msdfgen::FontHandle* font = ft ? msdfgen::loadFontData(ft, st->data, st->size) : nullptr;
+
+    for (;;) {
+        GenJob job;
+        {
+            std::unique_lock<std::mutex> lk(st->mtx);
+            st->cv.wait(lk, [&] { return st->stop || !st->jobs.empty(); });
+            if (st->stop) break;
+            job = st->jobs.front();
+            st->jobs.pop_front();
+        }
+
+        LARGE_INTEGER t0, t1, fq;
+        QueryPerformanceCounter(&t0);
+        GenResult res;
+        res.job = job;
+        res.ok = GenerateMSDFWith(font, res.pixels, job.codepoint, job.sdfW, job.sdfH);
+        QueryPerformanceCounter(&t1);
+        QueryPerformanceFrequency(&fq);
+        res.ms = (t1.QuadPart - t0.QuadPart) * 1000.0 / static_cast<double>(fq.QuadPart);
+
+        {
+            std::lock_guard<std::mutex> lk(st->mtx);
+            st->results.push_back(std::move(res));
+            st->hasResults.store(true, std::memory_order_release);
+        }
+    }
+
+    if (font) msdfgen::destroyFont(font);
+    if (ft) msdfgen::deinitializeFreetype(ft);
 }
 
 MSDFFont::AtlasPage* MSDFFont::GetAtlasPage(size_t index) const {
@@ -361,10 +520,15 @@ bool MSDFFont::UploadGlyphToAtlas(GlyphMetrics& metrics, uint32_t codepoint) {
 }
 
 bool MSDFFont::GenerateMSDF(std::vector<uint8_t>& outData, uint32_t codepoint, int sdfW, int sdfH) const {
+    return GenerateMSDFWith(m_msdfFont, outData, codepoint, sdfW, sdfH);
+}
+
+bool MSDFFont::GenerateMSDFWith(msdfgen::FontHandle* font, std::vector<uint8_t>& outData, uint32_t codepoint, int sdfW, int sdfH) {
+    if (!font) return false;
     if (sdfW <= 0 || sdfH <= 0 || sdfW > 512 || sdfH > 512) return false;
 
     msdfgen::Shape shape;
-    if (!msdfgen::loadGlyph(shape, m_msdfFont, codepoint)) return false;
+    if (!msdfgen::loadGlyph(shape, font, codepoint)) return false;
 
     if (shape.contours.empty()) {
         outData.assign(sdfW * sdfH * 4, 0);

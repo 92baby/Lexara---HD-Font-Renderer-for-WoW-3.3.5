@@ -3,6 +3,13 @@
 #include "MSDFCache.h"
 #include "../ShutdownCheck.h"
 #include "MSDFAtlasTiles.h"
+#include <atomic>
+#include <condition_variable>
+#include <deque>
+#include <memory>
+#include <mutex>
+#include <thread>
+#include <unordered_set>
 
 class MSDFFont {
     friend class MSDFCache;
@@ -21,6 +28,30 @@ private:
         uint32_t seq = 0;      // eviction sequence number the string's UVs were last known valid at
         uint32_t mask = 0;     // bitmask of tiles the string's glyphs live in
         bool complete = false; // false while some glyphs are still missing (string is being built incrementally)
+    };
+
+    // --- background glyph generation (runtime fonts only) ---
+    struct GenJob {
+        uint32_t codepoint = 0;
+        int sdfW = 0, sdfH = 0;
+        FT_Int bitmapLeft = 0, bitmapTop = 0;
+    };
+    struct GenResult {
+        GenJob job;
+        bool ok = false;
+        bool stored = false; // already handed to the disk cache
+        double ms = 0.0;
+        std::vector<uint8_t> pixels;
+    };
+    struct GenState {
+        std::mutex mtx;
+        std::condition_variable cv;
+        std::deque<GenJob> jobs;
+        std::vector<GenResult> results;
+        std::atomic<bool> hasResults{ false };
+        bool stop = false;
+        const FT_Byte* data = nullptr;
+        FT_Long size = 0;
     };
 
 public:
@@ -66,10 +97,26 @@ private:
     void EvictTile(uint32_t tile);
     bool UploadGlyphToAtlas(GlyphMetrics& metrics, uint32_t codepoint);
     bool GenerateMSDF(std::vector<uint8_t>& outData, uint32_t codepoint, int sdfW, int sdfH) const;
+    // Thread-safe core of GenerateMSDF: only touches the given font handle and thread-local buffers.
+    static bool GenerateMSDFWith(msdfgen::FontHandle* font, std::vector<uint8_t>& outData, uint32_t codepoint, int sdfW, int sdfH);
+
+    // Background generation: cache misses are generated on worker threads instead of the render thread.
+    void EnableAsyncGeneration() { m_asyncGen = true; }
+    void StartGenWorkers();
+    void StopGenWorkers();
+    void DrainGenResults();
+    static void GenWorkerMain(std::shared_ptr<GenState> state);
 
     static msdfgen::FontHandle* CreateMSDFHandle(const FT_Byte* data, FT_Long size);
 
     FT_Face m_ftFace;
+    const FT_Byte* m_fontData = nullptr;
+    FT_Long m_fontDataSize = 0;
+    bool m_asyncGen = false;
+    std::shared_ptr<GenState> m_gen;
+    std::vector<std::thread> m_genThreads;
+    ankerl::unordered_dense::map<uint32_t, GenResult> m_done; // finished by a worker, waiting for an atlas upload (render thread only)
+    std::unordered_set<uint32_t> m_inflight;                  // queued or being generated (render thread only)
     msdfgen::FontHandle* m_msdfFont;
     bool m_isValid;
 	uint32_t m_evictionCount;
