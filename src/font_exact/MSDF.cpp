@@ -35,6 +35,17 @@ namespace {
         d9 = k9; d10 = k10;
     }
 
+    // 统一的深度写入恢复入口：只有成功保存过原始状态时才恢复，避免恢复无效值。
+    void RestoreDiagZWrite(IDirect3DDevice9* dev) {
+        if (!s_diagZSaved) return;
+
+        if (dev) {
+            dev->SetRenderState(D3DRS_ZWRITEENABLE, s_diagSavedZ);
+        }
+
+        s_diagZSaved = false;
+    }
+
     IDirect3DPixelShader9* s_cachedPS = nullptr;
     IDirect3DVertexShader9* s_cachedVS = nullptr;
 
@@ -314,12 +325,12 @@ namespace {
 
     void __fastcall CGxuFontRenderBatchHk(CGxuFont* pThis) {
         DiagPollKeys();
+
         pThis->RenderBatch();
+
         s_text3dActive = false;
-        if (s_diagZSaved) {
-            if (IDirect3DDevice9* d = D3D::GetDevice()) d->SetRenderState(D3DRS_ZWRITEENABLE, s_diagSavedZ);
-            s_diagZSaved = false;
-        }
+        RestoreDiagZWrite(D3D::GetDevice());
+
         if (IDirect3DDevice9* device = D3D::GetDevice()) {
             constexpr float resetControl[4] = { 0, 0, 0, 0 };
             device->SetPixelShaderConstantF(MSDF::SDF_SAMPLER_SLOT, resetControl, 1);
@@ -604,14 +615,27 @@ namespace {
             Hooks::Detour(&CGxString::InitializeTextLineFn, CGxString__InitializeTextLineHk);
             DetourTransactionCommit();
 
-            D3D::RegisterDrawIndexedPrimitiveCallback([](IDirect3DDevice9* dev, D3DPRIMITIVETYPE, INT, UINT, UINT, UINT, UINT) {
-                if (!s_text3dActive || !s_diagNoZWrite) return;
-                if (!s_diagZSaved) {
-                    dev->GetRenderState(D3DRS_ZWRITEENABLE, &s_diagSavedZ);
-                    s_diagZSaved = true;
-                }
-                dev->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
-            });
+            D3D::RegisterDrawIndexedPrimitiveCallback(
+                [](IDirect3DDevice9* dev,
+                   D3DPRIMITIVETYPE,
+                   INT, UINT, UINT, UINT, UINT) {
+
+                    if (!s_text3dActive || !s_diagNoZWrite) return;
+
+                    if (!s_diagZSaved) {
+                        DWORD savedZ = TRUE;
+
+                        if (FAILED(dev->GetRenderState(
+                                D3DRS_ZWRITEENABLE, &savedZ))) {
+                            return;
+                        }
+
+                        s_diagSavedZ = savedZ;
+                        s_diagZSaved = true;
+                    }
+
+                    dev->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
+                });
 
             D3D::RegisterOnDestroy([]() {
                 if (s_cachedPS) { s_cachedPS->Release(); s_cachedPS = nullptr; }
