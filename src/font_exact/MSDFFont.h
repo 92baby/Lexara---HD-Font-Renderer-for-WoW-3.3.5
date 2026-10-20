@@ -71,7 +71,6 @@ public:
     static void Register(FT_Face face, const FT_Byte* data, FT_Long size);
     static void Unregister(FT_Face face);
     static void ClearAllCache();
-    static void RefreshAllValidityFromCache();
     static void Shutdown();
 
     // Call at the start of each font batch: runs atlas evictions deferred from the previous batch.

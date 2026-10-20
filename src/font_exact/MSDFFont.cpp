@@ -19,15 +19,7 @@ MSDFFont::MSDFFont(FT_Face face, const FT_Byte* fontData, FT_Long dataSize)
         face->family_name ? face->family_name : "Unknown", face->style_name ? face->style_name : "",
         MSDF::SDF_RENDER_SIZE, MSDF::SDF_SPREAD);
 
-    // Awesome-style CJK gate: do not enable MSDF until cache reaches threshold
-    if (MSDF::IS_CJK) {
-        m_isValid = (m_cache->GetManifestSize() >= MSDF::CJK_CACHE_THRESHOLD)
-                 || MSDF::ALLOW_UNSAFE_FONTS;
-    } else {
-        m_isValid = m_cache->GetManifestSize()
-                 || MSDF::ALLOW_UNSAFE_FONTS
-                 || MSDFValidator::IsFontMSDFCompatible(m_msdfFont);
-    }
+    m_isValid = m_cache->GetManifestSize() || MSDF::ALLOW_UNSAFE_FONTS || MSDFValidator::IsFontMSDFCompatible(m_msdfFont);
     if (m_isValid) m_glyphPool.reserve(4096);
 }
 
@@ -48,29 +40,20 @@ MSDFFont::~MSDFFont() {
 
 MSDFFont* MSDFFont::Get(FT_Face face) {
     auto it = s_fontHandles.find(face);
-    if (it == s_fontHandles.end() || !it->second) return nullptr;
-    MSDFFont* font = it->second.get();
-    // Auto-pregen may finish while the game is running; promote CJK fonts without restart
-    if (!font->m_isValid && MSDF::IS_CJK && font->m_cache &&
-        font->m_cache->GetManifestSize() >= MSDF::CJK_CACHE_THRESHOLD) {
-        font->m_isValid = true;
-        font->m_glyphPool.reserve(4096);
-        font->EnableAsyncGeneration();
+    if (it != s_fontHandles.end() && it->second->IsValid()) {
+        return it->second.get();
     }
-    return font->m_isValid ? font : nullptr;
+    return nullptr;
 }
 
 void MSDFFont::Register(FT_Face face, const FT_Byte* data, FT_Long size) {
     if (s_fontHandles.find(face) != s_fontHandles.end()) return;
     auto font = std::make_unique<MSDFFont>(face, data, size);
-    // Keep CJK fonts even when not yet CJK-READY so auto-pregen can promote them later.
-    if (font->m_msdfFont && (font->m_isValid || MSDF::IS_CJK)) {
+    if (font->m_msdfFont && font->m_isValid) {
         // Runtime fonts write their disk cache on a background thread (pre-generation stays synchronous).
         font->m_cache->SetAsyncWrites(true);
         // Cache misses are generated on worker threads (pre-generation keeps the synchronous path).
-        // Only enable async gen once the font is allowed to render via MSDF.
-        if (font->m_isValid)
-            font->EnableAsyncGeneration();
+        font->EnableAsyncGeneration();
         s_fontHandles[face] = std::move(font);
     }
 }
@@ -95,27 +78,6 @@ void MSDFFont::ClearAllCache() {
         }
     }
 }
-
-void MSDFFont::RefreshAllValidityFromCache() {
-    for (auto& kv : s_fontHandles) {
-        MSDFFont* font = kv.second.get();
-        if (!font || !font->m_cache) continue;
-        const bool wasValid = font->m_isValid;
-        if (MSDF::IS_CJK) {
-            if (font->m_cache->GetManifestSize() >= MSDF::CJK_CACHE_THRESHOLD)
-                font->m_isValid = true;
-        } else if (!font->m_isValid) {
-            font->m_isValid = font->m_cache->GetManifestSize() > 0
-                || MSDF::ALLOW_UNSAFE_FONTS
-                || (font->m_msdfFont && MSDFValidator::IsFontMSDFCompatible(font->m_msdfFont));
-        }
-        if (font->m_isValid) {
-            font->m_glyphPool.reserve(4096);
-            if (!wasValid) font->EnableAsyncGeneration();
-        }
-    }
-}
-
 
 void MSDFFont::Shutdown() {
     s_fontHandles.clear();

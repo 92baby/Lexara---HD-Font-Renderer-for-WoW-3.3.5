@@ -3,7 +3,6 @@
 #include "MSDFFont.h"
 #include "MSDFCache.h"
 #include "MSDFManager.h"
-#include "MSDFPregen.h"
 #include "MSDFShaders.h"
 #include "Utils.h"
 #include "Hooks.h"
@@ -315,8 +314,6 @@ namespace {
 
     void __fastcall CGxuFontRenderBatchHk(CGxuFont* pThis) {
         DiagPollKeys();
-        if (MSDF::IS_CJK)
-            MSDFPregen::StartAutoIfNeeded();
         pThis->RenderBatch();
         s_text3dActive = false;
         if (s_diagZSaved) {
@@ -517,8 +514,6 @@ namespace {
         if (result != 0 || !aface || !*aface) return result;
 
         MSDFFont::Register(*aface, file_base, file_size);
-        if (MSDF::IS_CJK)
-            MSDFPregen::RegisterForPreGen(*aface, file_base, file_size, face_index);
         return result;
     }
 
