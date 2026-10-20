@@ -173,11 +173,18 @@ const GlyphMetrics* MSDFFont::GetGlyph(uint32_t codepoint) {
     if (m_cache->TryLoadGlyph(codepoint, metrics)) {
         if (!UploadGlyphToAtlas(metrics, codepoint)) {
             // No room right now (eviction deferred) or upload failed: callers retry on later frames
+            static int s_n = 0;
+            if (s_n < 200) { ++s_n; Log("[DIAG] cache-hit glyph U+%04X upload failed (w=%u h=%u, evictPending=%d)", codepoint, metrics.width, metrics.height, m_evictionPending ? 1 : 0); }
             m_glyphPool.erase(it);
             return nullptr;
         }
+        if (metrics.width == 0 && codepoint >= 0x2E80) {
+            static int s_nb = 0;
+            if (s_nb < 200) { ++s_nb; Log("[DIAG] cache-hit glyph U+%04X is BLANK (width=0) -> would be invisible", codepoint); }
+        }
         return &metrics;
     }
+    LARGE_INTEGER diagT0; QueryPerformanceCounter(&diagT0);
 
     GlyphMetricsToStore storage;
     storage.codepoint = codepoint;
@@ -216,6 +223,8 @@ const GlyphMetrics* MSDFFont::GetGlyph(uint32_t codepoint) {
             const AtlasTiles::Result room = AllocateSlot(sdfW, sdfH, probe);
             if (room != AtlasTiles::Result::Ok) {
                 if (room == AtlasTiles::Result::Full) m_evictionPending = true;
+                static int s_n = 0;
+                if (s_n < 200) { ++s_n; Log("[DIAG] no atlas slot for U+%04X: %s (pages=%zu)", codepoint, room == AtlasTiles::Result::Full ? "FULL" : "PAGE_FAILED", m_atlasPages.size()); }
                 m_glyphPool.erase(it);
                 return nullptr;
             }
@@ -231,7 +240,20 @@ const GlyphMetrics* MSDFFont::GetGlyph(uint32_t codepoint) {
                 metrics.bitmapTop = storage.bitmapTop;
                 metrics.pixelData = storage.ownedPixelData.data();
                 uploadFailed = !UploadGlyphToAtlas(metrics, codepoint);
+            } else {
+                static int s_n = 0;
+                if (s_n < 200) { ++s_n; Log("[DIAG] GenerateMSDF FAILED for U+%04X (sdf %dx%d, glyphIndex=%u) -> stored as blank", codepoint, sdfW, sdfH, glyphIndex); }
             }
+        }
+    }
+    {
+        LARGE_INTEGER t1, fq; QueryPerformanceCounter(&t1); QueryPerformanceFrequency(&fq);
+        const double ms = (t1.QuadPart - diagT0.QuadPart) * 1000.0 / static_cast<double>(fq.QuadPart);
+        static int s_ns = 0;
+        if (ms > 8.0 && s_ns < 100) { ++s_ns; Log("[DIAG] slow glyph generation U+%04X: %.1f ms", codepoint, ms); }
+        if (metrics.width == 0 && codepoint >= 0x2E80) {
+            static int s_nb = 0;
+            if (s_nb < 200) { ++s_nb; Log("[DIAG] generated glyph U+%04X is BLANK (width=0, glyphIndex=%u)", codepoint, glyphIndex); }
         }
     }
     // Always store into the disk cache, whether or not the upload succeeded

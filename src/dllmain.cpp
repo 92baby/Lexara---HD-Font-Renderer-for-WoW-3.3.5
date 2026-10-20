@@ -30,6 +30,15 @@ void Log(const char* fmt, ...) {
         wcsncpy_s(s_path, p.c_str(), _TRUNCATE);
     }
 
+    // Keep the previous session's log: it is otherwise overwritten on every start,
+    // which loses the evidence of a bad session as soon as the game is relaunched.
+    if (s_first) {
+        std::wstring prev(s_path);
+        const size_t dot = prev.find_last_of(L'.');
+        prev = (dot == std::wstring::npos ? prev : prev.substr(0, dot)) + L".prev.log";
+        CopyFileW(s_path, prev.c_str(), FALSE);
+    }
+
     FILE* f = nullptr;
     if (_wfopen_s(&f, s_path, s_first ? L"wb" : L"ab") != 0 || !f) return;
     s_first = false;

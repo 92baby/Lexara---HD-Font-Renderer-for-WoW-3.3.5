@@ -104,7 +104,25 @@ namespace {
         // Only "pending" strings, or strings with neither stamp nor pending bit (just rebuilt), are scanned.
         {
             const uint32_t hi = pThis->m_flags >> 24;
-            if ((hi & 0x80) && !(hi & 0x40)) return;
+            if ((hi & 0x80) && !(hi & 0x40)) {
+                // DIAG: a stamped string must contain no unprocessed quads (u > 1). If it does, the game rebuilt
+                // the geometry without going through InitializeTextLine, and those glyphs will render empty.
+                CGxFontGeomBatch* b = pThis->m_geomBuffers[0];
+                if (b && b->m_verts.m_data && b->m_verts.m_count >= 4) {
+                    uint32_t bad = 0;
+                    for (uint32_t q = 0; q < b->m_verts.m_count; q += 4) {
+                        if (b->m_verts.m_data[q].u > 1.0f) ++bad;
+                    }
+                    static int s_n = 0;
+                    if (bad && s_n < 100) {
+                        ++s_n;
+                        Log("[DIAG] STAMPED string has %u/%u unprocessed quads, is3d=%d, flags=%08X, text='%s'",
+                            bad, b->m_verts.m_count / 4, (pThis->m_flags & 0x80) ? 1 : 0, pThis->m_flags,
+                            pThis->m_text ? pThis->m_text : "");
+                    }
+                }
+                return;
+            }
         }
         fontHandle->BeginString(pThis);
         uint32_t tileMask = 0;
@@ -125,6 +143,8 @@ namespace {
         const double scale = (is3d ? fontSizeMult : CGxuFont::GetFontEffectiveHeight(is3d, fontSizeMult) * 1.0) / MSDF::SDF_RENDER_SIZE;
         const double pad = MSDF::SDF_SPREAD * scale;
         bool incomplete = false; // 有字形暂时拿不到 -> 不盖章，下一帧重试
+        uint32_t missingCp = 0;  // DIAG: first codepoint that could not be resolved
+        int missingWhy = 0;      // DIAG: 1 = no MSDF glyph, 2 = no game glyph entry
 
         for (uint32_t q = 0; q < verts.m_count; q += 4) {
             CGxFontVertex* vBase = &verts.m_data[q];
@@ -132,10 +152,10 @@ namespace {
                 const uint32_t codepoint = vBase[0].u - 1.0f;
 
                 const GlyphMetrics* gm = fontHandle->GetGlyph(codepoint);
-                if (!gm) { incomplete = true; continue; }
+                if (!gm) { incomplete = true; if (!missingCp) { missingCp = codepoint; missingWhy = 1; } continue; }
 
                 CGxGlyphCacheEntry* entry = fontObj->GetOrCreateGlyphEntry(codepoint);
-                if (!entry) { incomplete = true; continue; }
+                if (!entry) { incomplete = true; if (!missingCp) { missingCp = codepoint; missingWhy = 2; } continue; }
                 if (gm->atlasTile != 0xFF) tileMask |= 1u << gm->atlasTile;
 
                 CGxFontVertex* vert0 = &vBase[0];
@@ -186,9 +206,11 @@ namespace {
         if (incomplete) {
             // Diagnostics for "missing characters": how often does a string have to wait for glyphs?
             static int s_incompleteLogged = 0;
-            if (s_incompleteLogged < 40) {
+            if (s_incompleteLogged < 300) {
                 ++s_incompleteLogged;
-                Log("[MSDF] string waiting for glyphs: is3d=%d quads=%u (#%d)", is3d ? 1 : 0, verts.m_count / 4, s_incompleteLogged);
+                Log("[MSDF] string waiting for glyphs: is3d=%d quads=%u firstMissing=U+%04X why=%d text='%s' (#%d)",
+                    is3d ? 1 : 0, verts.m_count / 4, missingCp, missingWhy,
+                    pThis->m_text ? pThis->m_text : "", s_incompleteLogged);
             }
             return;
         }
@@ -203,6 +225,12 @@ namespace {
             // Stale = a tile this string uses has been evicted since it was built: rebuild it.
             // Strings that use only surviving tiles stay valid and are not rebuilt.
             if (fontHandle->CheckString(pThis, stamped) == MSDFFont::StringState::Stale) {
+                static int s_staleLogged = 0;
+                if (s_staleLogged < 100) {
+                    ++s_staleLogged;
+                    Log("[DIAG] string stale -> rebuild: is3d=%d stamped=%d text='%s' (#%d)",
+                        (pThis->m_flags & 0x80) ? 1 : 0, stamped ? 1 : 0, pThis->m_text ? pThis->m_text : "", s_staleLogged);
+                }
                 pThis->ClearInstanceData();
                 pThis->m_flags &= 0x00FFFFFF;
             }
