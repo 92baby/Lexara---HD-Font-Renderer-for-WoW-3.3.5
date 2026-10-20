@@ -69,15 +69,34 @@ std::string MSDFCache::SanitizeName(std::string_view name) {
     return out.empty() ? "unnamed" : out;
 }
 
-std::string MSDFCache::GetCacheBasePath(const char* familyName, const char* styleName,
+std::filesystem::path MSDFCache::GetCacheBasePath(const char* familyName, const char* styleName,
     uint32_t sdfRenderSize, uint32_t sdfSpread) {
     std::string fam = SanitizeName(familyName);
     std::string sty = SanitizeName(styleName);
     std::string folderName = fam + "_" + sty + "_s" + std::to_string(sdfRenderSize) + "_sp" + std::to_string(sdfSpread);
+
+    // Preferred location: <folder containing wow.exe>\LEXARA\<font folder>.
+    // Falls back to %TEMP% if that folder cannot be created or written (e.g. read-only install location).
+    wchar_t exePath[MAX_PATH * 2] = {};
+    const DWORD n = GetModuleFileNameW(nullptr, exePath, static_cast<DWORD>(std::size(exePath)));
+    if (n > 0 && n < std::size(exePath)) {
+        std::filesystem::path base = std::filesystem::path(exePath).parent_path() / CACHE_DIR / folderName;
+        std::error_code ec;
+        std::filesystem::create_directories(base, ec);
+        if (!ec) {
+            // Make sure we can actually write there.
+            HANDLE h = CreateFileW((base / L".write_test").c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, nullptr);
+            if (h != INVALID_HANDLE_VALUE) {
+                CloseHandle(h);
+                return base;
+            }
+        }
+    }
+
     wchar_t tempPath[MAX_PATH] = {};
     GetTempPathW(MAX_PATH, tempPath);
-    std::filesystem::path base = std::filesystem::path(tempPath) / CACHE_DIR / folderName;
-    return base.string();
+    return std::filesystem::path(tempPath) / CACHE_DIR / folderName;
 }
 
 void MSDFCache::BuildBlockLockPath(uint32_t blockId, std::filesystem::path& outPath) const {
