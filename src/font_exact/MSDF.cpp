@@ -11,6 +11,23 @@
 namespace {
     uint32_t g_runtimeVBSize = 0;
 
+    // DIAG hotkeys (in-game A/B test for missing glyphs):
+    //   F9  = sample atlas at mip level 0 only (no mip filtering)
+    //   F10 = disable depth writes while drawing MSDF text
+    bool s_diagNoMip = false;
+    bool s_diagNoZWrite = false;
+    bool s_diagZSaved = false;
+    DWORD s_diagSavedZ = TRUE;
+
+    void DiagPollKeys() {
+        static bool d9 = false, d10 = false;
+        const bool k9 = (GetAsyncKeyState(VK_F9) & 0x8000) != 0;
+        const bool k10 = (GetAsyncKeyState(VK_F10) & 0x8000) != 0;
+        if (k9 && !d9) { s_diagNoMip = !s_diagNoMip; Log("[DIAG] F9: noMip = %d", s_diagNoMip ? 1 : 0); }
+        if (k10 && !d10) { s_diagNoZWrite = !s_diagNoZWrite; Log("[DIAG] F10: noZWrite = %d", s_diagNoZWrite ? 1 : 0); }
+        d9 = k9; d10 = k10;
+    }
+
     IDirect3DPixelShader9* s_cachedPS = nullptr;
     IDirect3DVertexShader9* s_cachedVS = nullptr;
 
@@ -269,7 +286,7 @@ namespace {
                 device->SetSamplerState(slot, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
                 // Auto-generated mipmaps report GetLevelCount() == 1, so use the font's flag instead.
                 // Trilinear when mips exist (the shader picks the LOD via tex2Dlod); pages without mips just use level 0.
-                device->SetSamplerState(slot, D3DSAMP_MIPFILTER, MSDFFont::IsAutoMipEnabled() ? D3DTEXF_LINEAR : D3DTEXF_NONE);
+                device->SetSamplerState(slot, D3DSAMP_MIPFILTER, (MSDFFont::IsAutoMipEnabled() && !s_diagNoMip) ? D3DTEXF_LINEAR : D3DTEXF_NONE);
                 device->SetSamplerState(slot, D3DSAMP_MIPMAPLODBIAS, 0);
                 device->SetSamplerState(slot, D3DSAMP_MAXMIPLEVEL, 0);
             }
@@ -284,10 +301,23 @@ namespace {
         };
         device->SetPixelShaderConstantF(MSDF::SDF_SAMPLER_SLOT, controlFlag, 1);
         device->SetVertexShaderConstantF(MSDF::SDF_SAMPLER_SLOT, controlFlag, 1);
+
+        if (s_diagNoZWrite) {
+            if (!s_diagZSaved) {
+                device->GetRenderState(D3DRS_ZWRITEENABLE, &s_diagSavedZ);
+                s_diagZSaved = true;
+            }
+            device->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
+        }
     }
 
     void __fastcall CGxuFontRenderBatchHk(CGxuFont* pThis) {
+        DiagPollKeys();
         pThis->RenderBatch();
+        if (s_diagZSaved) {
+            if (IDirect3DDevice9* d = D3D::GetDevice()) d->SetRenderState(D3DRS_ZWRITEENABLE, s_diagSavedZ);
+            s_diagZSaved = false;
+        }
         if (IDirect3DDevice9* device = D3D::GetDevice()) {
             constexpr float resetControl[4] = { 0, 0, 0, 0 };
             device->SetPixelShaderConstantF(MSDF::SDF_SAMPLER_SLOT, resetControl, 1);
