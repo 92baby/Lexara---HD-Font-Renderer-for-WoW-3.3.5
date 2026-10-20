@@ -52,7 +52,7 @@ namespace MSDF {
 	inline msdfgen::FreetypeHandle* g_msdfFreetype = nullptr;
 
     inline constexpr uint32_t MAX_ATLAS_PAGES = 4;
-    inline constexpr size_t CJK_CACHE_THRESHOLD = 16661;
+    inline constexpr size_t CJK_CACHE_THRESHOLD = 101;
 
 	inline bool IS_CJK = false;
 	inline bool INITIALIZED = false;

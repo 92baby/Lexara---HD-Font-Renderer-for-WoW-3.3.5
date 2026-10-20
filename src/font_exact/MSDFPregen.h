@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 #include "MSDF.h"
 #include "MSDFCache.h"
 
@@ -65,6 +65,8 @@ class MSDFPregen {
 public:
     static void RegisterForPreGen(FT_Face aface, const FT_Byte* data, FT_Long size, FT_Long faceIndex);
     static bool TryStartPreGen();
+    // Silent background pregen for CJK (no console). Safe to call every frame; runs once.
+    static void StartAutoIfNeeded();
     static void Shutdown() noexcept;
 
 private:
@@ -84,6 +86,7 @@ private:
         std::string styleName;
     };
 
+    static bool GenerateFontRange(const PreGenRequest& req, uint32_t start, uint32_t end, double cpuLimit, bool silent);
     static void ExecutePreGeneration();
     static bool AcquirePreGenLock();
     static void ReleasePreGenLock();

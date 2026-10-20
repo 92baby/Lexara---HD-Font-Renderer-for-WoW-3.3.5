@@ -1,6 +1,10 @@
 #include "MSDFPregen.h"
+#include "../Logger.h"
 #include "MSDFFont.h"
+#include "MSDFUtils.h"
 #include "MSDFValidator.h"
+#include <cstdarg>
+#include <atomic>
 
 void MSDFPregen::RegisterForPreGen(FT_Face face, const FT_Byte* data, FT_Long size, FT_Long faceIndex) {
     if (!face || !data || size <= 0) return;
@@ -202,11 +206,42 @@ bool MSDFPregen::GenerateFont(const PreGenRequest& req) {
 
     cpuLimit = std::clamp(cpuLimit, 1.0, 100.0);
     printf("CPU limit set to: %.0f%%\n", cpuLimit);
+    return GenerateFontRange(req, start, end, cpuLimit, false);
+}
 
-    printf("\nGenerating %u glyphs...\n", total);
+bool MSDFPregen::GenerateFontRange(const PreGenRequest& req, uint32_t start, uint32_t end, double cpuLimit, bool silent) {
+    auto say = [&](const char* fmt, ...) {
+        char buf[512];
+        va_list ap;
+        va_start(ap, fmt);
+        vsnprintf(buf, sizeof(buf), fmt, ap);
+        va_end(ap);
+        if (silent) Log("[MSDF-Auto] %s", buf);
+        else { fputs(buf, stdout); fflush(stdout); }
+    };
+
+    if (end < start) {
+        if (!silent) printf("ERROR: End must be >= start\n");
+        else Log("[MSDF-Auto] ERROR: End must be >= start");
+        return false;
+    }
+    const uint64_t total64 = static_cast<uint64_t>(end) - start + 1;
+    if (total64 > 0xFFFFFFFF) {
+        if (!silent) printf("ERROR: Range too large\n");
+        else Log("[MSDF-Auto] ERROR: Range too large");
+        return false;
+    }
+    const uint32_t total = static_cast<uint32_t>(total64);
+    cpuLimit = std::clamp(cpuLimit, 1.0, 100.0);
+
+    if (silent)
+        Log("[MSDF-Auto] Generating %s %s U+%04X-U+%04X (%u glyphs, CPU %.0f%%)",
+            req.familyName.c_str(), req.styleName.c_str(), start, end, total, cpuLimit);
+    else
+        printf("\nGenerating %u glyphs...\n", total);
 
     if (total == 0) {
-        printf("ERROR: %s\n", "Nothing to generate");
+        if (!silent) printf("ERROR: Nothing to generate\n");
         return false;
     }
 
@@ -216,21 +251,20 @@ bool MSDFPregen::GenerateFont(const PreGenRequest& req) {
 
     unsigned int hw = std::thread::hardware_concurrency();
     if (hw == 0) hw = 4;
-    const unsigned int numThreads = hw;
+    const unsigned int numThreads = silent ? (std::max(1u, hw / 2)) : hw;
 
     std::vector<FT_Face> threadFaces(numThreads, nullptr);
     FT_Library ftLib = nullptr;
 
     if (FT_Init_FreeType(&ftLib) != 0 || !ftLib) {
-        printf("ERROR: %s\n", "FT_Init_FreeType failed");
+        if (silent) Log("[MSDF-Auto] FT_Init_FreeType failed");
+        else printf("ERROR: FT_Init_FreeType failed\n");
         return false;
     }
 
     bool allHandlesValid = true;
     for (unsigned int i = 0; i < numThreads; ++i) {
         if (FT_New_Memory_Face(ftLib, req.data, req.size, req.faceIndex, &threadFaces[i]) != 0) {
-            const char* name = threadFaces[i] ? threadFaces[i]->family_name : nullptr;
-            printf("ERROR: FT_New_Memory_Face failed for %s\n", name ? name : "unknown font");
             allHandlesValid = false;
             break;
         }
@@ -249,7 +283,8 @@ bool MSDFPregen::GenerateFont(const PreGenRequest& req) {
             if (threadFaces[i]) FT_Done_Face(threadFaces[i]);
         }
         if (ftLib) FT_Done_FreeType(ftLib);
-        printf("ERROR: %s\n", "Failed to create MSDFFont instances");
+        if (silent) Log("[MSDF-Auto] Failed to create MSDFFont instances");
+        else printf("ERROR: Failed to create MSDFFont instances\n");
         return false;
     }
 
@@ -263,23 +298,31 @@ bool MSDFPregen::GenerateFont(const PreGenRequest& req) {
             uint32_t now = doneCount.load(std::memory_order_relaxed);
             if (now >= total) break;
             if (total > 0) {
-                printf("\rProgress: %u/%u (%.1f%%)   ", now, total,
-                    static_cast<double>(now) / total * 100.0);
-                fflush(stdout);
+                if (silent) {
+                    static uint32_t lastPct = 0;
+                    uint32_t pct = static_cast<uint32_t>(static_cast<double>(now) / total * 100.0);
+                    if (pct >= lastPct + 5 || now == 0) {
+                        lastPct = pct;
+                        Log("[MSDF-Auto] Progress %s %s: %u/%u (%u%%)",
+                            req.familyName.c_str(), req.styleName.c_str(), now, total, pct);
+                    }
+                } else {
+                    printf("\rProgress: %u/%u (%.1f%%)   ", now, total,
+                        static_cast<double>(now) / total * 100.0);
+                    fflush(stdout);
+                }
             }
-            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            std::this_thread::sleep_for(std::chrono::milliseconds(silent ? 2000 : 500));
         }
-        });
+    });
 
     auto worker = [&](uint32_t workerId, MSDFFont* font, FT_Face localFace) {
         if (!font || !localFace) {
             workerError.store(true, std::memory_order_release);
-            printf("ERROR: Invalid handles in worker %u\n", workerId);
             return;
         }
         if (FT_Set_Pixel_Sizes(localFace, MSDF::SDF_RENDER_SIZE, MSDF::SDF_RENDER_SIZE) != 0) {
             workerError.store(true, std::memory_order_release);
-            printf("ERROR: FT_Set_Pixel_Sizes failed in worker %u\n", workerId);
             return;
         }
 
@@ -333,10 +376,6 @@ bool MSDFPregen::GenerateFont(const PreGenRequest& req) {
                                 width = static_cast<uint16_t>(sdfW);
                                 height = static_cast<uint16_t>(sdfH);
                             }
-                            else {
-                                printf("WARNING: Glyph U+%04X size mismatch: got %zu, expected %zu\n",
-                                    cp, msdfData.size(), expectedSize);
-                            }
                         }
                     }
                 }
@@ -354,12 +393,12 @@ bool MSDFPregen::GenerateFont(const PreGenRequest& req) {
 
             {
                 std::lock_guard<std::mutex> lock(cacheMutex);
-                if (!cache.StoreGlyph(std::move(gm))) printf("WARNING: Failed to store glyph U+%04X\n", cp);
+                cache.StoreGlyph(std::move(gm));
             }
             doneCount.fetch_add(1, std::memory_order_relaxed);
         }
         pool.Release(std::move(msdfData));
-        };
+    };
 
     std::vector<std::thread> threads;
     threads.reserve(numThreads);
@@ -372,12 +411,13 @@ bool MSDFPregen::GenerateFont(const PreGenRequest& req) {
     }
     if (progressThread.joinable()) progressThread.join();
 
-    printf("\rProgress: %u/%u (100.0%%)                      \n", doneCount.load(), total);
+    if (!silent)
+        printf("\rProgress: %u/%u (100.0%%)                      \n", doneCount.load(), total);
 
-    printf("Writing to disk...");
-    fflush(stdout);
+    if (silent) Log("[MSDF-Auto] Writing cache for %s %s...", req.familyName.c_str(), req.styleName.c_str());
+    else { printf("Writing to disk..."); fflush(stdout); }
     cache.FlushPendingWrites();
-    printf(" Done.\n");
+    if (!silent) printf(" Done.\n");
 
     threadMSDFFonts.clear();
     for (auto face : threadFaces) {
@@ -386,13 +426,75 @@ bool MSDFPregen::GenerateFont(const PreGenRequest& req) {
     if (ftLib) FT_Done_FreeType(ftLib);
 
     bool success = !workerError.load(std::memory_order_acquire);
-    if (!success) {
-        printf("\nGeneration encountered errors. Press Enter to continue...");
-        getchar();
-    }
-    else {
-        printf("Generation complete. Press Enter to continue...");
-        getchar();
+    if (silent) {
+        Log("[MSDF-Auto] %s %s %s (%zu glyphs in cache)",
+            success ? "Complete" : "Failed",
+            req.familyName.c_str(), req.styleName.c_str(), cache.GetManifestSize());
+    } else {
+        if (!success) {
+            printf("\nGeneration encountered errors. Press Enter to continue...");
+            getchar();
+        } else {
+            printf("Generation complete. Press Enter to continue...");
+            getchar();
+        }
     }
     return success;
+}
+
+etchar();
+    }
+    return success;
+}
+void MSDFPregen::StartAutoIfNeeded() {
+    static std::atomic<bool> s_started{false};
+    if (s_started.exchange(true, std::memory_order_acq_rel)) return;
+    if (!MSDF::IS_CJK) return;
+    if (s_pendingRequests.empty()) {
+        // Fonts may register a bit later; allow one more try by resetting after short delay via thread
+    }
+
+    std::thread([]() {
+        // Wait a few seconds so login / font load finishes registering faces
+        std::this_thread::sleep_for(std::chrono::seconds(5));
+
+        if (!AcquirePreGenLock()) {
+            Log("[MSDF-Auto] Another client holds pregen lock; skip");
+            return;
+        }
+
+        std::vector<PreGenRequest> jobs;
+        {
+            jobs = s_pendingRequests;
+        }
+
+        if (jobs.empty()) {
+            Log("[MSDF-Auto] No fonts registered for pregen");
+            ReleasePreGenLock();
+            return;
+        }
+
+        std::string locale = MSDF::GetGameLocale();
+        uint32_t start = 0x0020, end = 0x9FFF;
+        if (locale == "koKR") { start = 0x0020; end = 0xD7AF; }
+
+        Log("[MSDF-Auto] Starting silent CJK pregen (%zu fonts, U+%04X-U+%04X)",
+            jobs.size(), start, end);
+
+        for (const auto& req : jobs) {
+            MSDFCache probe(nullptr, 0, req.familyName.c_str(), req.styleName.c_str(),
+                MSDF::SDF_RENDER_SIZE, MSDF::SDF_SPREAD);
+            const size_t count = probe.GetManifestSize();
+            if (count >= MSDF::CJK_CACHE_THRESHOLD) {
+                Log("[MSDF-Auto] Skip %s %s (already %zu glyphs) [CJK-READY]",
+                    req.familyName.c_str(), req.styleName.c_str(), count);
+                continue;
+            }
+            GenerateFontRange(req, start, end, 40.0, true); // 40% CPU, silent
+        }
+
+        ReleasePreGenLock();
+        MSDFFont::RefreshAllValidityFromCache();
+        Log("[MSDF-Auto] Finished; fonts meeting threshold are now MSDF-enabled");
+    }).detach();
 }
