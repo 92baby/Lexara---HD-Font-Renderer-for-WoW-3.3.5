@@ -5,7 +5,7 @@
 #include <ranges>
 
 MSDFFont::MSDFFont(FT_Face face, const FT_Byte* fontData, FT_Long dataSize)
-    : m_ftFace(face), m_msdfFont(nullptr), m_isValid(false), m_oldestPage(0), m_evictionCount(0)
+    : m_ftFace(face), m_msdfFont(nullptr), m_isValid(false), m_evictionCount(0)
 {
     if (!face) return;
 
@@ -45,7 +45,11 @@ MSDFFont* MSDFFont::Get(FT_Face face) {
 void MSDFFont::Register(FT_Face face, const FT_Byte* data, FT_Long size) {
     if (s_fontHandles.find(face) != s_fontHandles.end()) return;
     auto font = std::make_unique<MSDFFont>(face, data, size);
-    if (font->m_msdfFont && font->m_isValid) s_fontHandles[face] = std::move(font);
+    if (font->m_msdfFont && font->m_isValid) {
+        // Runtime fonts write their disk cache on a background thread (pre-generation stays synchronous).
+        font->m_cache->SetAsyncWrites(true);
+        s_fontHandles[face] = std::move(font);
+    }
 }
 
 void MSDFFont::Unregister(FT_Face face) {
@@ -60,7 +64,9 @@ void MSDFFont::ClearAllCache() {
         if (handle) {
             handle->m_glyphPool.clear();
             handle->m_atlasPages.clear();
-            handle->m_oldestPage = 0;
+            handle->m_tiles.Reset();
+            handle->m_strings.clear();
+            handle->m_evictLog.Record(0xFFFFFFFFu); // everything is invalid
             handle->m_evictionPending = false;
             handle->m_evictionCount++;
         }
@@ -73,33 +79,87 @@ void MSDFFont::Shutdown() {
 
 void MSDFFont::FlushPendingEvictions() {
     for (auto& handle : s_fontHandles | std::views::values) {
-        if (handle && handle->m_evictionPending) handle->ExecutePendingEviction();
+        if (!handle) continue;
+        handle->m_tiles.SetClock(++handle->m_clock);
+        if (handle->m_evictionPending) handle->ExecutePendingEviction();
     }
 }
 
 void MSDFFont::ExecutePendingEviction() {
     m_evictionPending = false;
-    // Fewer pages than the cap means page creation failed, not that the atlas is full: do not evict
-    if (m_atlasPages.size() < MSDF::MAX_ATLAS_PAGES) return;
+    // Free at most a couple of tiles per batch; glyphs that did not fit are retried on later frames.
+    constexpr int kMaxTilesPerBatch = 2;
+    for (int n = 0; n < kMaxTilesPerBatch; ++n) {
+        int victim = m_tiles.PickVictim();
+        if (victim < 0) break;
+        EvictTile(static_cast<uint32_t>(victim));
+    }
+}
 
-    AtlasPage* page = m_atlasPages[m_oldestPage].get();
-    for (uint32_t cp : page->codepoints) {
+void MSDFFont::EvictTile(uint32_t tile) {
+    for (uint32_t cp : m_tiles.Evict(tile)) {
         m_glyphPool.erase(cp);
     }
-    page->Clear();
 
-    D3DLOCKED_RECT fullRect;
-    if (page->texture && SUCCEEDED(page->texture->LockRect(0, &fullRect, nullptr, 0))) {
-        memset(fullRect.pBits, 0, static_cast<size_t>(MSDF::ATLAS_SIZE) * fullRect.Pitch);
-        page->texture->UnlockRect(0);
+    const uint32_t page = tile / AtlasTiles::TILES_PER_PAGE;
+    if (page < m_atlasPages.size() && m_atlasPages[page]->texture) {
+        const uint32_t ox = m_tiles.TileOriginX(tile), oy = m_tiles.TileOriginY(tile), sz = m_tiles.TileSize();
+        RECT r = { static_cast<LONG>(ox), static_cast<LONG>(oy), static_cast<LONG>(ox + sz), static_cast<LONG>(oy + sz) };
+        D3DLOCKED_RECT lr;
+        if (SUCCEEDED(m_atlasPages[page]->texture->LockRect(0, &lr, &r, 0))) {
+            auto* row = static_cast<unsigned char*>(lr.pBits);
+            for (uint32_t y = 0; y < sz; ++y, row += lr.Pitch) memset(row, 0, static_cast<size_t>(sz) * 4);
+            m_atlasPages[page]->texture->UnlockRect(0);
+        }
     }
+
+    m_evictLog.Record(1u << tile);
     m_evictionCount++;
-    m_oldestPage = (m_oldestPage + 1) % MSDF::MAX_ATLAS_PAGES;
+}
+
+MSDFFont::StringState MSDFFont::CheckString(const void* key, bool processedBefore) {
+    auto it = m_strings.find(key);
+    if (it == m_strings.end()) return processedBefore ? StringState::Stale : StringState::Fresh;
+
+    StringInfo& si = it->second;
+    // A complete record on a string that has not been processed yet is a leftover from a dead
+    // string that used the same address: forget it.
+    if (!processedBefore && si.complete) {
+        m_strings.erase(it);
+        return StringState::Fresh;
+    }
+    if (!m_evictLog.StillValid(si.seq, si.mask)) {
+        m_strings.erase(it);
+        return StringState::Stale;
+    }
+    si.seq = m_evictLog.Seq();
+    for (uint32_t m = si.mask; m; m &= m - 1) {
+        m_tiles.Touch(static_cast<uint32_t>(std::countr_zero(m)));
+    }
+    return StringState::Valid;
+}
+
+void MSDFFont::BeginString(const void* key) {
+    auto it = m_strings.find(key);
+    if (it != m_strings.end() && it->second.complete) m_strings.erase(it);
+}
+
+void MSDFFont::AccumulateString(const void* key, uint32_t tileMask, bool complete) {
+    // Addresses of dead strings are never reported to us; bound the table and let strings rebuild if it overflows.
+    if (m_strings.size() > 16384) m_strings.clear();
+
+    StringInfo& si = m_strings[key];
+    si.mask |= tileMask;
+    si.seq = m_evictLog.Seq();
+    si.complete = complete;
 }
 
 const GlyphMetrics* MSDFFont::GetGlyph(uint32_t codepoint) {
     auto pit = m_glyphPool.find(codepoint);
-    if (pit != m_glyphPool.end()) return &pit->second;
+    if (pit != m_glyphPool.end()) {
+        if (pit->second.atlasTile != 0xFF) m_tiles.Touch(pit->second.atlasTile);
+        return &pit->second;
+    }
 
     auto [it, inserted] = m_glyphPool.try_emplace(codepoint);
     GlyphMetrics& metrics = it->second;
@@ -146,9 +206,10 @@ const GlyphMetrics* MSDFFont::GetGlyph(uint32_t codepoint) {
 
             // Check the atlas has room BEFORE generating, so no CPU is wasted on a glyph that cannot be placed.
             // Mark eviction as pending; it runs at the start of the next batch.
-            int16_t slotPage = -1;
-            if (!AllocateSlot(sdfW, sdfH, slotPage)) {
-                m_evictionPending = true;
+            AtlasTiles::Slot probe;
+            const AtlasTiles::Result room = AllocateSlot(sdfW, sdfH, probe);
+            if (room != AtlasTiles::Result::Ok) {
+                if (room == AtlasTiles::Result::Full) m_evictionPending = true;
                 m_glyphPool.erase(it);
                 return nullptr;
             }
@@ -185,7 +246,7 @@ MSDFFont::AtlasPage* MSDFFont::GetAtlasPage(size_t index) const {
 }
 
 bool MSDFFont::CreateAtlasPage() {
-    auto page = std::make_unique<AtlasPage>(MSDF::ATLAS_GUTTER);
+    auto page = std::make_unique<AtlasPage>();
 
     bool created = false;
     if (s_autoMip) {
@@ -214,47 +275,32 @@ bool MSDFFont::CreateAtlasPage() {
     return true;
 }
 
-bool MSDFFont::AllocateSlot(uint16_t w, uint16_t h, int16_t& outPage) {
-    for (size_t i = 0; i < m_atlasPages.size(); ++i) {
-        AtlasPage* page = m_atlasPages[i].get();
-        if (page->nextX + w + MSDF::ATLAS_GUTTER <= MSDF::ATLAS_SIZE &&
-            page->nextY + h + MSDF::ATLAS_GUTTER <= MSDF::ATLAS_SIZE) {
-            outPage = static_cast<int16_t>(i);
-            return true;
+AtlasTiles::Result MSDFFont::AllocateSlot(uint16_t w, uint16_t h, AtlasTiles::Slot& slot) {
+    return m_tiles.Find(w, h, slot, [this](uint32_t page) {
+        while (m_atlasPages.size() <= page) {
+            if (!CreateAtlasPage()) return false;
         }
-        int nextY = page->nextY + page->rowHeight + MSDF::ATLAS_GUTTER;
-        if (nextY + h + MSDF::ATLAS_GUTTER <= MSDF::ATLAS_SIZE) {
-            page->nextX = MSDF::ATLAS_GUTTER;
-            page->nextY = nextY;
-            page->rowHeight = 0;
-            outPage = static_cast<int16_t>(i);
-            return true;
-        }
-    }
-    if (m_atlasPages.size() < MSDF::MAX_ATLAS_PAGES) {
-        if (!CreateAtlasPage()) return false;
-        outPage = static_cast<int16_t>(m_atlasPages.size() - 1);
         return true;
-    }
-    return false; // full: caller marks eviction as pending
+    });
 }
 
 bool MSDFFont::UploadGlyphToAtlas(GlyphMetrics& metrics, uint32_t codepoint) {
     if (!metrics.pixelData || metrics.width == 0 || metrics.height == 0) return true;
 
-    int16_t pageIndex = -1;
-    if (!AllocateSlot(metrics.width, metrics.height, pageIndex)) {
+    AtlasTiles::Slot slot;
+    const AtlasTiles::Result room = AllocateSlot(metrics.width, metrics.height, slot);
+    if (room != AtlasTiles::Result::Ok) {
         // Never evict mid-frame: strings already processed this frame would point at wiped atlas regions.
-        m_evictionPending = true;
+        if (room == AtlasTiles::Result::Full) m_evictionPending = true;
         return false;
     }
-    AtlasPage* targetPage = m_atlasPages[pageIndex].get();
+    AtlasPage* targetPage = m_atlasPages[slot.page].get();
     if (!targetPage->texture) return false;
 
     // Lock only this glyph's sub-rectangle: avoids dirtying and re-uploading the whole 16MB page
     RECT lockRect = {
-        targetPage->nextX, targetPage->nextY,
-        targetPage->nextX + metrics.width, targetPage->nextY + metrics.height
+        static_cast<LONG>(slot.x), static_cast<LONG>(slot.y),
+        static_cast<LONG>(slot.x + metrics.width), static_cast<LONG>(slot.y + metrics.height)
     };
     D3DLOCKED_RECT lockedRect;
     if (FAILED(targetPage->texture->LockRect(0, &lockedRect, &lockRect, 0))) {
@@ -274,17 +320,15 @@ bool MSDFFont::UploadGlyphToAtlas(GlyphMetrics& metrics, uint32_t codepoint) {
     }
     targetPage->texture->UnlockRect(0);
 
-    float atlasSize = static_cast<float>(MSDF::ATLAS_SIZE);
-    metrics.u0 = static_cast<float>(targetPage->nextX) / atlasSize;
-    metrics.v0 = static_cast<float>(targetPage->nextY) / atlasSize;
-    metrics.u1 = static_cast<float>(targetPage->nextX + metrics.width) / atlasSize;
-    metrics.v1 = static_cast<float>(targetPage->nextY + metrics.height) / atlasSize;
-    metrics.atlasPageIndex = pageIndex;
+    const float atlasSize = static_cast<float>(MSDF::ATLAS_SIZE);
+    metrics.u0 = static_cast<float>(slot.x) / atlasSize;
+    metrics.v0 = static_cast<float>(slot.y) / atlasSize;
+    metrics.u1 = static_cast<float>(slot.x + metrics.width) / atlasSize;
+    metrics.v1 = static_cast<float>(slot.y + metrics.height) / atlasSize;
+    metrics.atlasPageIndex = static_cast<uint16_t>(slot.page);
+    metrics.atlasTile = static_cast<uint8_t>(slot.tile);
 
-    targetPage->nextX += metrics.width + MSDF::ATLAS_GUTTER;
-    targetPage->rowHeight = std::max(targetPage->rowHeight, static_cast<int>(metrics.height));
-    targetPage->codepoints.push_back(codepoint);
-
+    m_tiles.Commit(slot, metrics.width, metrics.height, codepoint);
     return true;
 }
 

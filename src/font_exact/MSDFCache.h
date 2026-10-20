@@ -4,6 +4,7 @@
 #include "ankerl/unordered_dense.h"
 #include <filesystem>
 #include <deque>
+#include <atomic>
 
 class MSDFManager;
 class MSDFPregen;
@@ -119,6 +120,45 @@ private:
     void BuildBlockPath(uint32_t blockId, std::filesystem::path& outPath) const;
 
     bool FlushPendingWrites();
+
+    // ---- Background (asynchronous) writes -------------------------------------------------
+    // Runtime caches write to disk on a worker thread so the render thread never waits on file I/O.
+    // The worker only touches files and its own buffers; all shared state (manifest, mapped blocks)
+    // stays on the render thread, which applies finished jobs in DrainAsyncResults().
+    // Pre-generation keeps the original synchronous path (m_async == false).
+    void SetAsyncWrites(bool enable);
+
+    struct AsyncJob {
+        MSDFCache* owner = nullptr;
+        uint32_t blockId = 0;
+        std::filesystem::path blockPath;
+        std::filesystem::path blockLockPath;
+        std::filesystem::path manifestLockPath;
+        std::filesystem::path journalPath;
+        std::vector<GlyphMetricsToStore> glyphs;
+    };
+    struct AsyncResult {
+        MSDFCache* owner = nullptr;
+        uint32_t blockId = 0;
+        std::vector<ManifestEntry> entries; // empty if the job failed
+    };
+    struct AsyncState; // defined in MSDFCache.cpp
+
+    static AsyncState& GetAsyncState();
+    static void WorkerMain();
+    static bool ExecuteJob(AsyncJob& job, std::vector<ManifestEntry>& outEntries);
+    static bool ReadWholeFile(const std::filesystem::path& path, std::vector<uint8_t>& out);
+    static bool AppendJournalFile(const std::filesystem::path& path, const std::vector<ManifestEntry>& entries);
+    static void DrainAsyncResults();
+
+    // inlineMode: run the jobs on the calling thread (used at process exit, when the worker may already be gone)
+    bool FlushPendingWritesAsync(bool inlineMode = false);
+    void WaitForAsyncIdle();
+
+    bool m_async = false;
+    std::atomic<uint32_t> m_inflightJobs{ 0 };
+    // blocks with a write in flight: their glyphs are not read from disk until the write lands
+    ankerl::unordered_dense::map<uint32_t, uint32_t> m_inflightBlocks;
     bool WriteBlockFile(uint32_t blockId, std::vector<GlyphMetricsToStore*>& pending, std::vector<ManifestEntry>& outEntries);
     void CleanupOrphans() const;
 

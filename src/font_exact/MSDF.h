@@ -17,6 +17,7 @@ struct GlyphMetrics {
 	FT_Int bitmapLeft = 0;
     float u0 = 0.0f, v0 = 0.0f, u1 = 0.0f, v1 = 0.0f;
     uint16_t atlasPageIndex = 0;
+    uint8_t atlasTile = 0xFF; // tile inside the atlas (0xFF = none, e.g. blank glyphs)
     const uint8_t* pixelData = nullptr;
 };
 

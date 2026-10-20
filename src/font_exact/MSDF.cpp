@@ -46,12 +46,12 @@ namespace {
     bool s_msdfInitHookArmed = false;
     std::vector<uint32_t> s_prefetchPayload;
 
-    // 状态位布局（CGxString::m_flags 高字节）：
-    //   bit 31      : 版本令牌有效
-    //   bit 30      : 待处理（0x40000000，由 InitializeTextLine 置位）
-    //   bit 24-29   : 图集淘汰版本（仅 6 位，避免与 bit 30 冲突）
+    // CGxString::m_flags high byte:
+    //   bit 31 : geometry processed ("stamped")
+    //   bit 30 : pending (0x40000000, set by InitializeTextLine)
+    //   bits 24-29 : unused. Whether a stamped string is still valid is tracked by MSDFFont
+    //                (per-string tile mask + eviction log), not by a version number in the flags.
     constexpr uint32_t kPendingFlag = 0x40000000;
-    constexpr uint32_t kVersionMask = 0x3F;
 
     // 把 UTF-8 文本解码为 Unicode 码点（中文客户端文本为 UTF-8 多字节）
     void AppendUtf8Codepoints(const char* text, std::vector<uint32_t>& out) {
@@ -98,14 +98,15 @@ namespace {
         MSDFFont* fontHandle = MSDFFont::Get(pThis->GetFontFace());
         if (!fontHandle) return;
 
-        // 已盖过版本章且没有待处理标记 -> 跳过（无论版本是否一致）。
-        // 版本不一致的旧字符串必须留给下一帧的 CheckGeometryHk 去 ClearInstanceData 重建；
-        // 如果在这里重新盖章，会把过期的 UV 当成最新的锁死。
-        // 只有“待处理”或“既没有令牌也没有待处理位（刚被清除重建）”才扫描 u>1 的四边形。
+        // Already stamped and not pending -> nothing to do. Strings whose tiles were evicted are
+        // detected and rebuilt by CheckGeometryHk; never re-stamp them here or stale UVs would be locked in.
+        // Only "pending" strings, or strings with neither stamp nor pending bit (just rebuilt), are scanned.
         {
             const uint32_t hi = pThis->m_flags >> 24;
             if ((hi & 0x80) && !(hi & 0x40)) return;
         }
+        fontHandle->BeginString(pThis);
+        uint32_t tileMask = 0;
 
         CGxFontGeomBatch* batch = pThis->m_geomBuffers[0];
         if (!batch || batch->m_verts.m_count < 4) return;
@@ -134,6 +135,7 @@ namespace {
 
                 CGxGlyphCacheEntry* entry = fontObj->GetOrCreateGlyphEntry(codepoint);
                 if (!entry) { incomplete = true; continue; }
+                if (gm->atlasTile != 0xFF) tileMask |= 1u << gm->atlasTile;
 
                 CGxFontVertex* vert0 = &vBase[0];
                 CGxFontVertex* vert1 = &vBase[1];
@@ -176,23 +178,24 @@ namespace {
         }
 
         // 有字形没拿到：保留现有标记、不盖版本章，下一帧 CheckGeometry 会再次进来重试
+        // Remember which tiles this string uses (also for partial passes, so a later eviction is noticed).
+        fontHandle->AccumulateString(pThis, tileMask, !incomplete);
+
+        // Some glyphs unavailable: keep the pending bit and do not stamp; retried next frame.
         if (incomplete) return;
 
-        // 令牌只用 6 位，避免与待处理位 0x40000000 冲突；盖章同时清掉待处理位
-        const uint32_t versionToken = (fontHandle->GetAtlasEvictionCount() & kVersionMask) | 0x80;
-        pThis->m_flags = (pThis->m_flags & 0x00FFFFFF) | (versionToken << 24);
+        // Stamp = processed. Validity is tracked by MSDFFont (tile mask + eviction log), not by the token.
+        pThis->m_flags = (pThis->m_flags & 0x00FFFFFF) | (0x80u << 24);
     }
 
     bool __fastcall CGxString__CheckGeometryHk(CGxString* pThis) {
         if (MSDFFont* fontHandle = MSDFFont::Get(pThis->GetFontFace())) {
-            uint32_t highByte = (pThis->m_flags >> 24) & 0xFF;
-            if ((highByte & 0x80) != 0) {
-                uint8_t storedVersion = highByte & kVersionMask;
-                uint8_t currentVersion = static_cast<uint8_t>(fontHandle->GetAtlasEvictionCount() & kVersionMask);
-                if (storedVersion != currentVersion) {
-                    pThis->ClearInstanceData();
-                    pThis->m_flags &= 0x00FFFFFF;
-                }
+            const bool stamped = ((pThis->m_flags >> 24) & 0x80) != 0;
+            // Stale = a tile this string uses has been evicted since it was built: rebuild it.
+            // Strings that use only surviving tiles stay valid and are not rebuilt.
+            if (fontHandle->CheckString(pThis, stamped) == MSDFFont::StringState::Stale) {
+                pThis->ClearInstanceData();
+                pThis->m_flags &= 0x00FFFFFF;
             }
         }
         CGxFontGeomBatch* batch = pThis->m_geomBuffers[0];
