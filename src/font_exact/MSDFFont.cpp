@@ -1,3 +1,4 @@
+#include "../Logger.h"
 #include "MSDFFont.h"
 #include "MSDFCache.h"
 #include "MSDFValidator.h"
@@ -115,6 +116,11 @@ void MSDFFont::EvictTile(uint32_t tile) {
 
     m_evictLog.Record(1u << tile);
     m_evictionCount++;
+
+    // Diagnostics: frequent evictions mean the working set does not fit the atlas.
+    if (m_evictionCount <= 10 || (m_evictionCount % 100) == 0) {
+        Log("[MSDF] atlas tile eviction #%zu: tile %u freed", m_evictionCount, tile);
+    }
 }
 
 MSDFFont::StringState MSDFFont::CheckString(const void* key, bool processedBefore) {

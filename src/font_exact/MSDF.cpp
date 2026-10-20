@@ -1,3 +1,4 @@
+#include "../Logger.h"
 #include "MSDF.h"
 #include "MSDFFont.h"
 #include "MSDFCache.h"
@@ -182,7 +183,15 @@ namespace {
         fontHandle->AccumulateString(pThis, tileMask, !incomplete);
 
         // Some glyphs unavailable: keep the pending bit and do not stamp; retried next frame.
-        if (incomplete) return;
+        if (incomplete) {
+            // Diagnostics for "missing characters": how often does a string have to wait for glyphs?
+            static int s_incompleteLogged = 0;
+            if (s_incompleteLogged < 40) {
+                ++s_incompleteLogged;
+                Log("[MSDF] string waiting for glyphs: is3d=%d quads=%u (#%d)", is3d ? 1 : 0, verts.m_count / 4, s_incompleteLogged);
+            }
+            return;
+        }
 
         // Stamp = processed. Validity is tracked by MSDFFont (tile mask + eviction log), not by the token.
         pThis->m_flags = (pThis->m_flags & 0x00FFFFFF) | (0x80u << 24);

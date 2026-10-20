@@ -89,13 +89,22 @@ inline auto* pixelShaderHLSL = R"(
 		float screenPxRange = (control.z / max(footprint, 1e-6)) * (1.0f - min(0.3f, fontSize * 0.0035f)); // smoother edges for larger text
 		float opacity = saturate((sd - 0.5f) * screenPxRange + 0.5f);
 
+		float4 result;
 		if (outlinePx > 0.0f) {
 			// *5 of the outline msdf, mult has to match alpha-channel range
-			return float4(
+			result = float4(
 				lerp(float3(0.0f, 0.0f, 0.0f), IN.col.rgb, opacity),
 				max(opacity, saturate((sample.a - 0.5f) * screenPxRange * 5.0f + outlinePx)) * IN.col.a
 			);
+		} else {
+			result = float4(IN.col.rgb, opacity * IN.col.a);
 		}
-		return float4(IN.col.rgb, opacity * IN.col.a);
+
+		// Each glyph quad is padded by the SDF spread, and neighbouring quads overlap in that padding.
+		// Pixels that end up fully transparent must not be written at all: with depth testing/writing on
+		// (3D text such as names above heads) they would otherwise hide the next glyph's edge,
+		// and which pixels lose depends on the camera angle.
+		clip(result.a - 0.004f);
+		return result;
 	}
 )";
