@@ -17,22 +17,32 @@ namespace {
     // for 3D MSDF text, right before each draw call (the game may re-set the state at any time).
     //
     // Hotkeys for A/B comparison (Ctrl+Shift held, so they do not collide with game key bindings):
+    //   Ctrl+Shift+F7  = toggle: CULL_NONE for 3D text (default ON)
+    //   Ctrl+Shift+F8  = toggle: ZENABLE off for 3D text (default ON)
     //   Ctrl+Shift+F9  = toggle: sample atlas at mip level 0 only
     //   Ctrl+Shift+F10 = toggle: depth-write-off for 3D text (default ON)
     bool s_diagNoMip = false;
-    bool s_diagNoZWrite = true;
+    bool s_diagNoZWrite = true;   // F10: depth-write off for 3D (default ON)
+    bool s_diagNoZTest = true;    // experimental: also disable Z test for 3D nameplates
+    bool s_diagNoCull = true;     // experimental: D3DCULL_NONE for 3D nameplates
     bool s_text3dActive = false;
-    bool s_diagZSaved = false;
-    DWORD s_diagSavedZ = TRUE;
+    bool s_diagStateSaved = false;
+    DWORD s_diagSavedZWrite = TRUE;
+    DWORD s_diagSavedZEnable = TRUE;
+    DWORD s_diagSavedCull = D3DCULL_CCW;
 
     void DiagPollKeys() {
-        static bool d9 = false, d10 = false;
+        static bool d8 = false, d9 = false, d10 = false, d7 = false;
         const bool mods = (GetAsyncKeyState(VK_CONTROL) & 0x8000) && (GetAsyncKeyState(VK_SHIFT) & 0x8000);
+        const bool k7 = mods && (GetAsyncKeyState(VK_F7) & 0x8000) != 0;
+        const bool k8 = mods && (GetAsyncKeyState(VK_F8) & 0x8000) != 0;
         const bool k9 = mods && (GetAsyncKeyState(VK_F9) & 0x8000) != 0;
         const bool k10 = mods && (GetAsyncKeyState(VK_F10) & 0x8000) != 0;
+        if (k7 && !d7) { s_diagNoCull = !s_diagNoCull; Log("[DIAG] F7: noCull = %d", s_diagNoCull ? 1 : 0); }
+        if (k8 && !d8) { s_diagNoZTest = !s_diagNoZTest; Log("[DIAG] F8: noZTest = %d", s_diagNoZTest ? 1 : 0); }
         if (k9 && !d9) { s_diagNoMip = !s_diagNoMip; Log("[DIAG] F9: noMip = %d", s_diagNoMip ? 1 : 0); }
         if (k10 && !d10) { s_diagNoZWrite = !s_diagNoZWrite; Log("[DIAG] F10: noZWrite = %d", s_diagNoZWrite ? 1 : 0); }
-        d9 = k9; d10 = k10;
+        d7 = k7; d8 = k8; d9 = k9; d10 = k10;
     }
 
     // Rate-limited diagnostics. The old "first N lines" counters were used up on the login screen
@@ -114,7 +124,6 @@ namespace {
     // Called from the asm hook: run evictions deferred from the previous batch before validating strings
     void __cdecl FlushFontEvictions() {
         MSDFFont::FlushPendingEvictions();
-        MSDFFont::StepDiskWarmup();
     }
 
     void __cdecl PrefetchCodepoints(CGxString* pThis) {
@@ -188,9 +197,7 @@ namespace {
             if (vBase[0].u > 1.0f) {
                 const uint32_t codepoint = vBase[0].u - 1.0f;
 
-                // 3D nameplates generate missing glyphs on the render thread so mid-name characters
-                // (e.g. 世界 in 旧世界武器军需官) do not stay blank for many frames waiting on workers.
-                const GlyphMetrics* gm = fontHandle->GetGlyph(codepoint, /*preferSync=*/is3d);
+                const GlyphMetrics* gm = fontHandle->GetGlyph(codepoint);
                 if (!gm) { incomplete = true; if (!missingCp) { missingCp = codepoint; missingWhy = 1; } continue; }
 
                 CGxGlyphCacheEntry* entry = fontObj->GetOrCreateGlyphEntry(codepoint);
@@ -246,10 +253,9 @@ namespace {
             // Diagnostics for "missing characters": rate-limited per kind (3D and 2D separately), no fixed cap.
             if (is3d) ++s_stat3dWaiting; else ++s_stat2dWaiting;
             static ULONGLONG s_last2d = 0, s_last3d = 0;
-            // 3D: 100ms so short-lived nameplate misses are more likely to appear in the log
-            if (LogEvery(is3d ? s_last3d : s_last2d, is3d ? 100 : 3000)) {
-                Log("[MSDF] string waiting for glyphs: is3d=%d quads=%u firstMissing=U+%04X why=%d preferSync=%d text='%s'",
-                    is3d ? 1 : 0, verts.m_count / 4, missingCp, missingWhy, is3d ? 1 : 0,
+            if (LogEvery(is3d ? s_last3d : s_last2d, is3d ? 250 : 3000)) {
+                Log("[MSDF] string waiting for glyphs: is3d=%d quads=%u firstMissing=U+%04X why=%d text='%s'",
+                    is3d ? 1 : 0, verts.m_count / 4, missingCp, missingWhy,
                     pThis->m_text ? pThis->m_text : "");
             }
             return;
@@ -350,9 +356,13 @@ namespace {
         }
         pThis->RenderBatch();
         s_text3dActive = false;
-        if (s_diagZSaved) {
-            if (IDirect3DDevice9* d = D3D::GetDevice()) d->SetRenderState(D3DRS_ZWRITEENABLE, s_diagSavedZ);
-            s_diagZSaved = false;
+        if (s_diagStateSaved) {
+            if (IDirect3DDevice9* d = D3D::GetDevice()) {
+                d->SetRenderState(D3DRS_ZWRITEENABLE, s_diagSavedZWrite);
+                d->SetRenderState(D3DRS_ZENABLE, s_diagSavedZEnable);
+                d->SetRenderState(D3DRS_CULLMODE, s_diagSavedCull);
+            }
+            s_diagStateSaved = false;
         }
         if (IDirect3DDevice9* device = D3D::GetDevice()) {
             constexpr float resetControl[4] = { 0, 0, 0, 0 };
@@ -589,10 +599,9 @@ namespace {
         return 1;
     }
 
-    // 3D text depth fix. MUST be registered from MSDF::initialize() (i.e. at DLL attach, before the
-    // device exists): D3D.cpp only detours DrawIndexedPrimitive in CGxDevice::DeviceCreate if somebody
-    // is already listening at that moment. Registering from FreeType_InitHk can be too late, and then
-    // this callback never runs (the Ctrl+Shift+F10 toggle would change nothing).
+    // 3D nameplate state: overlapping SDF quads + client depth/cull can make individual
+    // glyphs (e.g. 外域) vanish at some camera angles. Applied only while s_text3dActive.
+    // MUST register from MSDF::initialize() before the device exists.
     void RegisterText3DDepthHook() {
         static bool s_done = false;
         if (s_done) return;
@@ -600,13 +609,20 @@ namespace {
         D3D::RegisterDrawIndexedPrimitiveCallback([](IDirect3DDevice9* dev, D3DPRIMITIVETYPE, INT, UINT, UINT, UINT, UINT) {
             if (!s_text3dActive) return;
             static bool s_loggedFirst = false;
-            if (!s_loggedFirst) { s_loggedFirst = true; Log("[DIAG] DIP hook: first 3D text draw seen (noZWrite=%d)", s_diagNoZWrite ? 1 : 0); }
-            if (!s_diagNoZWrite) return;
-            if (!s_diagZSaved) {
-                dev->GetRenderState(D3DRS_ZWRITEENABLE, &s_diagSavedZ);
-                s_diagZSaved = true;
+            if (!s_loggedFirst) {
+                s_loggedFirst = true;
+                Log("[DIAG] DIP hook: first 3D text draw (noZWrite=%d noZTest=%d noCull=%d)",
+                    s_diagNoZWrite ? 1 : 0, s_diagNoZTest ? 1 : 0, s_diagNoCull ? 1 : 0);
             }
-            dev->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
+            if (!s_diagStateSaved) {
+                dev->GetRenderState(D3DRS_ZWRITEENABLE, &s_diagSavedZWrite);
+                dev->GetRenderState(D3DRS_ZENABLE, &s_diagSavedZEnable);
+                dev->GetRenderState(D3DRS_CULLMODE, &s_diagSavedCull);
+                s_diagStateSaved = true;
+            }
+            if (s_diagNoZWrite) dev->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
+            if (s_diagNoZTest)  dev->SetRenderState(D3DRS_ZENABLE, FALSE);
+            if (s_diagNoCull)   dev->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
         });
     }
 
